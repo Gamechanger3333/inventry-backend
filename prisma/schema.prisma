@@ -20,6 +20,17 @@ model User {
   createdAt    DateTime @default(now()) @map("created_at")
   updatedAt    DateTime @updatedAt @map("updated_at")
 
+  // Email verification
+  emailVerified         Boolean   @default(false) @map("email_verified")
+  otpCode                String?   @map("otp_code") @db.VarChar(10)
+  otpExpiresAt           DateTime? @map("otp_expires_at")
+  verifyToken             String?   @unique @map("verify_token")
+  verifyTokenExpiresAt    DateTime? @map("verify_token_expires_at")
+
+  // Password reset
+  resetToken           String?   @unique @map("reset_token")
+  resetTokenExpiresAt  DateTime? @map("reset_token_expires_at")
+
   inventoryTransactions InventoryTransaction[]
   aiConversations       AiConversation[]
 

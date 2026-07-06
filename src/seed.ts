@@ -15,6 +15,7 @@ async function seed() {
       email: "admin@nexus.com",
       passwordHash,
       role: "Administrator",
+      emailVerified: true,
     },
   });
   console.log(`👤 User: ${admin.email} (password: password123)`);
