@@ -4,6 +4,103 @@ import { requireAuth, AuthRequest } from "../middleware/auth";
 
 const router = Router();
 
+class InsufficientStockError extends Error {
+  constructor(productName: string) {
+    super(`Insufficient stock for ${productName}`);
+    this.name = "InsufficientStockError";
+  }
+}
+
+// This schema doesn't tie a SalesOrder to a specific warehouse, so
+// "completing" a sale draws stock from whichever warehouse(s) have it,
+// cheapest-first by warehouse id, until the line quantity is covered.
+// Each individual deduction is recorded as its own InventoryTransaction so
+// that a later cancellation can reverse exactly what was taken from where.
+async function deductStockForOrder(
+  tx: any,
+  orderId: number,
+  orderNumber: string,
+  items: { productId: number; quantity: number }[],
+  performedBy: number | null | undefined
+) {
+  for (const item of items) {
+    const inventoryRows = await tx.inventory.findMany({
+      where: { productId: item.productId, quantity: { gt: 0 } },
+      orderBy: { warehouseId: "asc" },
+    });
+
+    const totalAvailable = inventoryRows.reduce((sum, row) => sum + row.quantity, 0);
+    if (totalAvailable < item.quantity) {
+      const product = await tx.product.findUnique({ where: { id: item.productId } });
+      throw new InsufficientStockError(product?.name ?? `product #${item.productId}`);
+    }
+
+    let remaining = item.quantity;
+    for (const row of inventoryRows) {
+      if (remaining <= 0) break;
+      const take = Math.min(row.quantity, remaining);
+
+      const decremented = await tx.inventory.updateMany({
+        where: { productId: row.productId, warehouseId: row.warehouseId, quantity: { gte: take } },
+        data: { quantity: { decrement: take } },
+      });
+      if (decremented.count === 0) {
+        // Stock moved under us - bail out and let the caller retry.
+        throw new InsufficientStockError(`product #${item.productId} (concurrent update)`);
+      }
+
+      await tx.inventoryTransaction.create({
+        data: {
+          productId: row.productId,
+          warehouseId: row.warehouseId,
+          type: "sale",
+          quantity: -take,
+          reason: `Sales order ${orderNumber} completed`,
+          notes: `orderId:${orderId}`,
+          performedBy: performedBy ?? null,
+        },
+      });
+
+      remaining -= take;
+    }
+  }
+}
+
+// Reverses exactly the deductions recorded by deductStockForOrder for this
+// order (looked up via the InventoryTransaction log), used when a completed
+// order is later cancelled.
+async function restockOrder(
+  tx: any,
+  orderId: number,
+  orderNumber: string,
+  performedBy: number | null | undefined
+) {
+  const saleTxns = await tx.inventoryTransaction.findMany({
+    where: { type: "sale", notes: `orderId:${orderId}` },
+  });
+
+  for (const t of saleTxns) {
+    const restoreQty = Math.abs(t.quantity);
+    await tx.inventory.upsert({
+      where: { productId_warehouseId: { productId: t.productId, warehouseId: t.warehouseId } },
+      update: { quantity: { increment: restoreQty } },
+      create: { productId: t.productId, warehouseId: t.warehouseId, quantity: restoreQty },
+    });
+
+    await tx.inventoryTransaction.create({
+      data: {
+        productId: t.productId,
+        warehouseId: t.warehouseId,
+        type: "sale_reversal",
+        quantity: restoreQty,
+        reason: `Sales order ${orderNumber} cancelled - stock restored`,
+        notes: `orderId:${orderId}`,
+        performedBy: performedBy ?? null,
+      },
+    });
+  }
+}
+
 function genOrderNumber(): string {
   return `SO-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
 }
@@ -166,20 +263,55 @@ router.patch("/:id", requireAuth, async (req: AuthRequest, res: Response): Promi
     const id = parseInt(req.params.id);
     const { status, notes } = req.body;
 
-    const order = await prisma.salesOrder.update({
+    const existing = await prisma.salesOrder.findUnique({
       where: { id },
-      data: {
-        ...(status !== undefined && { status }),
-        ...(notes !== undefined && { notes }),
-      },
-      include: {
-        customer: { select: { name: true } },
-        items: { include: { product: { select: { name: true, sku: true } } } },
-      },
+      include: { items: true },
+    });
+    if (!existing) {
+      res.status(404).json({ error: "Not found" });
+      return;
+    }
+
+    const wasCompleted = existing.status === "completed";
+    const willBeCompleted = status === "completed";
+
+    const order = await prisma.$transaction(async (tx) => {
+      // Deduct stock the moment an order first becomes "completed".
+      if (willBeCompleted && !wasCompleted) {
+        await deductStockForOrder(
+          tx,
+          existing.id,
+          existing.orderNumber,
+          existing.items.map((i) => ({ productId: i.productId, quantity: i.quantity })),
+          req.user?.id
+        );
+      }
+
+      // Put stock back if a completed order is moved to any other status
+      // (e.g. cancelled / refunded).
+      if (wasCompleted && status !== undefined && !willBeCompleted) {
+        await restockOrder(tx, existing.id, existing.orderNumber, req.user?.id);
+      }
+
+      return tx.salesOrder.update({
+        where: { id },
+        data: {
+          ...(status !== undefined && { status }),
+          ...(notes !== undefined && { notes }),
+        },
+        include: {
+          customer: { select: { name: true } },
+          items: { include: { product: { select: { name: true, sku: true } } } },
+        },
+      });
     });
 
     res.json(formatOrder(order));
   } catch (err: any) {
+    if (err instanceof InsufficientStockError) {
+      res.status(400).json({ error: err.message });
+      return;
+    }
     if (err.code === "P2025") {
       res.status(404).json({ error: "Not found" });
       return;

@@ -131,50 +131,65 @@ router.patch("/:id", requireAuth, async (req: AuthRequest, res: Response): Promi
     const id = parseInt(req.params.id);
     const { status, notes, expectedDate } = req.body;
 
-    const order = await prisma.purchaseOrder.update({
-      where: { id },
-      data: {
-        ...(status !== undefined && { status }),
-        ...(notes !== undefined && { notes }),
-        ...(expectedDate !== undefined && { expectedDate: new Date(expectedDate) }),
-      },
-      include: {
-        supplier: { select: { name: true } },
-        warehouse: { select: { name: true } },
-        items: { include: { product: { select: { name: true, sku: true } } } },
-      },
-    });
-
-    // Auto-update inventory when order is received
-    if (status === "received" && order.warehouseId) {
-      for (const item of order.items) {
-        await prisma.inventory.upsert({
-          where: {
-            productId_warehouseId: {
-              productId: item.productId,
-              warehouseId: order.warehouseId,
-            },
-          },
-          update: { quantity: { increment: item.quantity } },
-          create: {
-            productId: item.productId,
-            warehouseId: order.warehouseId,
-            quantity: item.quantity,
-          },
-        });
-
-        await prisma.inventoryTransaction.create({
-          data: {
-            productId: item.productId,
-            warehouseId: order.warehouseId,
-            type: "purchase_receipt",
-            quantity: item.quantity,
-            reason: `Purchase order ${order.orderNumber} received`,
-            performedBy: req.user?.id ?? null,
-          },
-        });
-      }
+    const existing = await prisma.purchaseOrder.findUnique({ where: { id } });
+    if (!existing) {
+      res.status(404).json({ error: "Not found" });
+      return;
     }
+
+    // Guard against double-processing: if this order was already marked
+    // "received" once, don't add the stock again on a subsequent save
+    // (e.g. someone re-saving the same order, or a duplicate request).
+    const alreadyReceived = existing.status === "received";
+    const isBeingReceived = status === "received" && !alreadyReceived;
+
+    const order = await prisma.$transaction(async (tx) => {
+      const updated = await tx.purchaseOrder.update({
+        where: { id },
+        data: {
+          ...(status !== undefined && { status }),
+          ...(notes !== undefined && { notes }),
+          ...(expectedDate !== undefined && { expectedDate: new Date(expectedDate) }),
+        },
+        include: {
+          supplier: { select: { name: true } },
+          warehouse: { select: { name: true } },
+          items: { include: { product: { select: { name: true, sku: true } } } },
+        },
+      });
+
+      if (isBeingReceived && updated.warehouseId) {
+        for (const item of updated.items) {
+          await tx.inventory.upsert({
+            where: {
+              productId_warehouseId: {
+                productId: item.productId,
+                warehouseId: updated.warehouseId,
+              },
+            },
+            update: { quantity: { increment: item.quantity } },
+            create: {
+              productId: item.productId,
+              warehouseId: updated.warehouseId,
+              quantity: item.quantity,
+            },
+          });
+
+          await tx.inventoryTransaction.create({
+            data: {
+              productId: item.productId,
+              warehouseId: updated.warehouseId,
+              type: "purchase_receipt",
+              quantity: item.quantity,
+              reason: `Purchase order ${updated.orderNumber} received`,
+              performedBy: req.user?.id ?? null,
+            },
+          });
+        }
+      }
+
+      return updated;
+    });
 
     res.json(formatOrder(order));
   } catch (err: any) {

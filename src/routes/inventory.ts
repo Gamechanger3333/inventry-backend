@@ -4,6 +4,13 @@ import { requireAuth, AuthRequest } from "../middleware/auth";
 
 const router = Router();
 
+class InsufficientStockError extends Error {
+  constructor() {
+    super("Insufficient stock in source warehouse");
+    this.name = "InsufficientStockError";
+  }
+}
+
 // GET /api/inventory
 router.get("/", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
@@ -49,31 +56,39 @@ router.post("/adjust", requireAuth, async (req: AuthRequest, res: Response): Pro
       return;
     }
 
-    const existing = await prisma.inventory.findUnique({
-      where: { productId_warehouseId: { productId, warehouseId } },
-    });
+    // Everything below must happen atomically: two concurrent adjustments on
+    // the same product/warehouse must not read the same "before" quantity
+    // and clobber each other. We do the read-check-write inside a single
+    // transaction so Postgres serializes conflicting writes for us.
+    const inv = await prisma.$transaction(async (tx) => {
+      const existing = await tx.inventory.findUnique({
+        where: { productId_warehouseId: { productId, warehouseId } },
+      });
 
-    const newQty = Math.max(0, (existing?.quantity ?? 0) + quantity);
+      const newQty = Math.max(0, (existing?.quantity ?? 0) + quantity);
 
-    const inv = await prisma.inventory.upsert({
-      where: { productId_warehouseId: { productId, warehouseId } },
-      update: { quantity: newQty },
-      create: { productId, warehouseId, quantity: Math.max(0, quantity) },
-      include: {
-        product: { select: { name: true, sku: true, reorderPoint: true } },
-        warehouse: { select: { name: true } },
-      },
-    });
+      const updated = await tx.inventory.upsert({
+        where: { productId_warehouseId: { productId, warehouseId } },
+        update: { quantity: newQty },
+        create: { productId, warehouseId, quantity: Math.max(0, quantity) },
+        include: {
+          product: { select: { name: true, sku: true, reorderPoint: true } },
+          warehouse: { select: { name: true } },
+        },
+      });
 
-    await prisma.inventoryTransaction.create({
-      data: {
-        productId,
-        warehouseId,
-        type: "adjustment",
-        quantity,
-        reason,
-        performedBy: req.user?.id ?? null,
-      },
+      await tx.inventoryTransaction.create({
+        data: {
+          productId,
+          warehouseId,
+          type: "adjustment",
+          quantity,
+          reason,
+          performedBy: req.user?.id ?? null,
+        },
+      });
+
+      return updated;
     });
 
     // Auto-create low-stock notification
@@ -113,22 +128,41 @@ router.post("/transfer", requireAuth, async (req: AuthRequest, res: Response): P
       res.status(400).json({ error: "productId, fromWarehouseId, toWarehouseId and quantity are required" });
       return;
     }
-
-    const fromInv = await prisma.inventory.findUnique({
-      where: { productId_warehouseId: { productId, warehouseId: fromWarehouseId } },
-    });
-
-    if (!fromInv || fromInv.quantity < quantity) {
-      res.status(400).json({ error: "Insufficient stock in source warehouse" });
+    if (quantity <= 0) {
+      res.status(400).json({ error: "Quantity must be greater than zero" });
+      return;
+    }
+    if (fromWarehouseId === toWarehouseId) {
+      res.status(400).json({ error: "Source and destination warehouse must be different" });
       return;
     }
 
     await prisma.$transaction(async (tx) => {
-      // Decrease from source
-      await tx.inventory.update({
+      // Re-read the source row *inside* the transaction and guard the
+      // decrement with a conditional update, so two concurrent transfers
+      // can't both pass the "enough stock" check against the same stale
+      // read and drive the quantity negative.
+      const fromInv = await tx.inventory.findUnique({
         where: { productId_warehouseId: { productId, warehouseId: fromWarehouseId } },
-        data: { quantity: fromInv.quantity - quantity },
       });
+
+      if (!fromInv || fromInv.quantity < quantity) {
+        throw new InsufficientStockError();
+      }
+
+      const decremented = await tx.inventory.updateMany({
+        where: {
+          productId,
+          warehouseId: fromWarehouseId,
+          quantity: { gte: quantity },
+        },
+        data: { quantity: { decrement: quantity } },
+      });
+
+      if (decremented.count === 0) {
+        // Someone else consumed the stock between our read and our write.
+        throw new InsufficientStockError();
+      }
 
       // Increase at destination
       await tx.inventory.upsert({
@@ -165,6 +199,10 @@ router.post("/transfer", requireAuth, async (req: AuthRequest, res: Response): P
 
     res.json({ message: "Transfer completed successfully" });
   } catch (err) {
+    if (err instanceof InsufficientStockError) {
+      res.status(400).json({ error: "Insufficient stock in source warehouse" });
+      return;
+    }
     console.error("Transfer inventory error:", err);
     res.status(500).json({ error: "Internal server error" });
   }

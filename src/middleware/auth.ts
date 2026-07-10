@@ -2,7 +2,17 @@ import { Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
 import prisma from "../lib/prisma";
 
-const JWT_SECRET = process.env.JWT_SECRET || "nexus-fallback-secret-2024";
+// A hardcoded fallback secret is a serious security hole (anyone who reads
+// the source code - or the public GitHub repo - can forge valid tokens).
+// Only allow the fallback outside of production, and fail loudly so a
+// missing JWT_SECRET can't go unnoticed in a real deployment.
+const JWT_SECRET = process.env.JWT_SECRET || (() => {
+  if (process.env.NODE_ENV === "production") {
+    throw new Error("JWT_SECRET environment variable must be set in production");
+  }
+  console.warn("⚠️  JWT_SECRET not set - using an insecure development-only default. Set JWT_SECRET in your .env file.");
+  return "nexus-dev-only-insecure-secret";
+})();
 
 export interface AuthRequest extends Request {
   user?: {
@@ -13,7 +23,7 @@ export interface AuthRequest extends Request {
     avatar: string | null;
     createdAt: Date;
     updatedAt: Date;
-    passwordHash: string;
+    emailVerified: boolean;
   };
 }
 
@@ -45,7 +55,23 @@ export async function requireAuth(
     res.status(401).json({ error: "Invalid token" });
     return;
   }
-  const user = await prisma.user.findUnique({ where: { id: payload.userId } });
+  // Select only the fields routes actually need - in particular, never
+  // load passwordHash onto req.user. It doesn't need to exist in memory
+  // past the login/register handlers, and keeping it off this object means
+  // a stray `res.json(req.user)` somewhere can never leak it.
+  const user = await prisma.user.findUnique({
+    where: { id: payload.userId },
+    select: {
+      id: true,
+      name: true,
+      email: true,
+      role: true,
+      avatar: true,
+      createdAt: true,
+      updatedAt: true,
+      emailVerified: true,
+    },
+  });
   if (!user) {
     res.status(401).json({ error: "User not found" });
     return;
