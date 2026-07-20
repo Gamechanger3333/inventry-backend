@@ -28,11 +28,11 @@ function wrapper(title: string, bodyHtml: string): string {
   </div>`;
 }
 
-async function sendEmail(to: string, subject: string, html: string) {
+async function sendEmail(to: string, subject: string, html: string): Promise<boolean> {
   const resend = getResend();
   if (!resend) {
     console.warn(`[email] RESEND_API_KEY not set — skipping send to ${to}`);
-    return;
+    return false;
   }
   console.log(`[email] Sending "${subject}" to ${to}`);
   const { data, error } = await resend.emails.send({ from: FROM, to, subject, html });
@@ -41,9 +41,10 @@ async function sendEmail(to: string, subject: string, html: string) {
     console.error("[email] Resend error:", error);
     throw new Error("Failed to send email");
   }
+  return true;
 }
 
-export async function sendVerificationEmail(to: string, name: string, otp: string, token: string) {
+export async function sendVerificationEmail(to: string, name: string, otp: string, token: string): Promise<boolean> {
   const link = `${FRONTEND_URL}/verify-email?token=${token}`;
   const html = wrapper(
     `Verify your email, ${name.split(" ")[0]}`,
@@ -65,10 +66,10 @@ export async function sendVerificationEmail(to: string, name: string, otp: strin
     </div>
     `
   );
-  await sendEmail(to, "Verify your Nexus account", html);
+  return sendEmail(to, "Verify your Nexus account", html);
 }
 
-export async function sendOtpEmail(to: string, name: string, otp: string) {
+export async function sendOtpEmail(to: string, name: string, otp: string): Promise<boolean> {
   const html = wrapper(
     `Your verification code`,
     `
@@ -83,10 +84,10 @@ export async function sendOtpEmail(to: string, name: string, otp: string) {
     <p style="color:#94a3b8; font-size:13px; text-align:center; margin:0;">This code expires in 15 minutes.</p>
     `
   );
-  await sendEmail(to, "Your Nexus verification code", html);
+  return sendEmail(to, "Your Nexus verification code", html);
 }
 
-export async function sendPasswordResetEmail(to: string, name: string, token: string) {
+export async function sendPasswordResetEmail(to: string, name: string, token: string): Promise<boolean> {
   const link = `${FRONTEND_URL}/reset-password?token=${token}`;
   const html = wrapper(
     `Reset your password`,
@@ -103,5 +104,5 @@ export async function sendPasswordResetEmail(to: string, name: string, token: st
     <p style="color:#94a3b8; font-size:12px; text-align:center; word-break:break-all;">${link}</p>
     `
   );
-  await sendEmail(to, "Reset your Nexus password", html);
+  return sendEmail(to, "Reset your Nexus password", html);
 }

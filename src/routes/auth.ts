@@ -64,8 +64,9 @@ router.post("/register", async (req: Request, res: Response): Promise<void> => {
       },
     });
 
+    let emailSent = false;
     try {
-      await sendVerificationEmail(user.email, user.name, otp, verifyToken);
+      emailSent = await sendVerificationEmail(user.email, user.name, otp, verifyToken);
     } catch (emailErr) {
       console.error("Failed to send verification email:", emailErr);
       // Don't fail registration just because the email didn't send —
@@ -73,8 +74,15 @@ router.post("/register", async (req: Request, res: Response): Promise<void> => {
     }
 
     res.status(201).json({
-      message: "Account created. Please check your email for a verification code.",
+      message: emailSent
+        ? "Account created. Please check your email for a verification code."
+        : "Account created. No email provider is configured, so here is your verification code directly.",
       email: user.email,
+      // DEV-ONLY FALLBACK: if no email provider is configured (no
+      // RESEND_API_KEY), there is no other way for the user to receive
+      // this code. Never sent once a real provider is wired up, and never
+      // sent in production even if email happens to be misconfigured there.
+      ...(process.env.NODE_ENV !== "production" && !emailSent ? { devOtp: otp } : {}),
     });
   } catch (err) {
     console.error("Register error:", err);
@@ -190,8 +198,19 @@ router.post("/resend-otp", async (req: Request, res: Response): Promise<void> =>
       },
     });
 
-    await sendOtpEmail(user.email, user.name, otp);
-    res.json({ message: "If an account exists, a new code has been sent." });
+    let emailSent = false;
+    try {
+      emailSent = await sendOtpEmail(user.email, user.name, otp);
+    } catch (emailErr) {
+      // Previously uncaught here - a failed send would 500 the whole
+      // request and leave the user with no way to get a new code at all.
+      console.error("Failed to send OTP email:", emailErr);
+    }
+
+    res.json({
+      message: "If an account exists, a new code has been sent.",
+      ...(process.env.NODE_ENV !== "production" && !emailSent ? { devOtp: otp } : {}),
+    });
   } catch (err) {
     console.error("Resend OTP error:", err);
     res.status(500).json({ error: "Internal server error" });
@@ -261,9 +280,21 @@ router.post("/forgot-password", async (req: Request, res: Response): Promise<voi
       },
     });
 
-   await sendPasswordResetEmail(user.email, user.name, resetToken);
+    let emailSent = false;
+    try {
+      emailSent = await sendPasswordResetEmail(user.email, user.name, resetToken);
+    } catch (emailErr) {
+      console.error("Failed to send password reset email:", emailErr);
+    }
 
-    res.json({ message: "If an account exists for this email, a reset link has been sent." });
+    res.json({
+      message: "If an account exists for this email, a reset link has been sent.",
+      // DEV-ONLY FALLBACK: no email provider configured means there's no
+      // other way to get this token. Never sent in production.
+      ...(process.env.NODE_ENV !== "production" && !emailSent
+        ? { devResetToken: resetToken }
+        : {}),
+    });
   } catch (err) {
     console.error("Forgot password error:", err);
     res.status(500).json({ error: "Internal server error" });
