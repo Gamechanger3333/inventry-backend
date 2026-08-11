@@ -1,6 +1,7 @@
 import { Router, Response } from "express";
 import prisma from "../lib/prisma";
-import { requireAuth, AuthRequest } from "../middleware/auth";
+import { requireAuth, requireRole, AuthRequest } from "../middleware/auth";
+import { getPagination, sendPaginated } from "../lib/pagination";
 
 const router = Router();
 
@@ -8,26 +9,37 @@ const router = Router();
 router.get("/", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { search } = req.query as Record<string, string>;
+    const pagination = getPagination(req);
 
-    const customers = await prisma.customer.findMany({
-      where: search
-        ? {
-            OR: [
-              { name: { contains: search, mode: "insensitive" } },
-              { email: { contains: search, mode: "insensitive" } },
-            ],
-          }
-        : undefined,
-      include: { _count: { select: { salesOrders: true } } },
-      orderBy: { name: "asc" },
-    });
+    const where = search
+      ? {
+          OR: [
+            { name: { contains: search, mode: "insensitive" as const } },
+            { email: { contains: search, mode: "insensitive" as const } },
+          ],
+        }
+      : undefined;
 
-    res.json(
+    const [customers, total] = await Promise.all([
+      prisma.customer.findMany({
+        where,
+        include: { _count: { select: { salesOrders: true } } },
+        orderBy: { name: "asc" },
+        skip: pagination.skip,
+        take: pagination.take,
+      }),
+      prisma.customer.count({ where }),
+    ]);
+
+    sendPaginated(
+      res,
       customers.map((c) => ({
         ...c,
         orderCount: c._count.salesOrders,
         createdAt: c.createdAt.toISOString(),
-      }))
+      })),
+      total,
+      pagination
     );
   } catch (err) {
     console.error("List customers error:", err);
@@ -122,7 +134,7 @@ router.patch("/:id", requireAuth, async (req: AuthRequest, res: Response): Promi
 });
 
 // DELETE /api/customers/:id
-router.delete("/:id", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
+router.delete("/:id", requireAuth, requireRole("Sales Representative", "Finance Manager"), async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const id = parseInt(req.params.id);
     await prisma.customer.delete({ where: { id } });

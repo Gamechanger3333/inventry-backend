@@ -1,5 +1,6 @@
 import { Router, Request, Response } from "express";
 import { requireAuth, AuthRequest } from "../middleware/auth";
+import { publicAiLimiter } from "../middleware/rateLimit";
 import prisma from "../lib/prisma";
 
 const router = Router();
@@ -7,7 +8,11 @@ const router = Router();
 const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_MODEL = "llama-3.3-70b-versatile";
 
-const SYSTEM_PROMPT = `You are an AI assistant for Nexus, an Inventory & Sales Management System. 
+const LANGUAGE_INSTRUCTION = `Always reply in the same language and script the user just wrote in — including Roman Urdu/Hindi (Latin-script transliteration), Urdu/Hindi/Arabic script, Spanish, French, or any other language. Detect it from their latest message, don't ask which language to use, and don't switch languages mid-conversation unless the user does. Match their tone (casual vs formal) too.`;
+
+const SYSTEM_PROMPT = `You are an AI assistant for Nexus, an Inventory & Sales Management System.
+You have tools that query the real, live database — use them whenever a question depends on actual data (stock levels, sales figures, specific products/customers, invoices, purchase orders, warehouses). Never guess or make up numbers, names, or SKUs; call a tool to find out. If no tool covers what's being asked, say so honestly instead of inventing an answer.
+
 You help users with:
 - Understanding inventory levels, product stock, and reorder recommendations
 - Analyzing sales trends, revenue data, and customer insights
@@ -15,7 +20,9 @@ You help users with:
 - Generating reports and business insights
 - Answering questions about how to use the system
 
-Be concise, professional, and data-focused.`;
+${LANGUAGE_INSTRUCTION}
+
+Be concise, professional, and data-focused. Lead with the concrete numbers/names the tools return. If a request is ambiguous, ask one short clarifying question instead of guessing which tool to call.`;
 
 // Used on the public marketing site (landing page, login/signup, etc.)
 // where there is no logged-in user and therefore no business data to talk
@@ -23,6 +30,10 @@ Be concise, professional, and data-focused.`;
 const PUBLIC_SYSTEM_PROMPT = `You are the pre-sales assistant on the Nexus marketing website. Nexus is an all-in-one inventory and sales management SaaS with: multi-warehouse inventory tracking with low-stock alerts, sales & purchase order management, customer/supplier CRM, invoicing, profit & loss and inventory reports, and role-based accounts.
 
 You help visitors understand what Nexus does, whether it fits their business, and how to get started (sign up is free, no credit card required; there's also a demo login: sarah@acmecorp.com / password123).
+
+${LANGUAGE_INSTRUCTION}
+
+If someone reports a login/account problem, don't just repeat "check your credentials" — walk through it step by step: (1) confirm they're using the exact email they signed up with, no typos or extra spaces, (2) check Caps Lock / autocorrect on mobile, (3) try the demo login to confirm the platform itself is reachable, (4) use the "Forgot password?" link on the login page to reset it, (5) if it still fails after a reset, it's likely account-specific and they should sign up fresh or contact support — you (the pre-sales widget) can't look up or fix their actual account since you have no access to user data.
 
 You do NOT have access to any specific user's account, inventory, or sales data - if asked about "my" stock or orders, tell them to sign in first and use the in-app assistant. Keep answers short (2-4 sentences) and friendly. Don't discuss anything unrelated to Nexus or general inventory/sales-management best practices.`;
 
@@ -54,6 +65,275 @@ async function callGroq(messages: { role: string; content: string }[], systemPro
 
   const data = (await response.json()) as any;
   return data.choices?.[0]?.message?.content ?? "";
+}
+
+// ─────────────────────────────────────────────────────────────────
+// RAG: instead of naive vector search over documents (this app has
+// structured relational data, not free text), the assistant is given
+// a set of "tools" it can call. The model decides which ones it needs
+// for a given question, we run the real Prisma query, feed the result
+// back to it, and it answers grounded in that live data. This is more
+// accurate than embedding-based retrieval for tabular business data.
+// ─────────────────────────────────────────────────────────────────
+
+const AI_TOOLS = [
+  {
+    type: "function",
+    function: {
+      name: "get_inventory_overview",
+      description: "Get a summary of current inventory: total distinct products, total units in stock across all warehouses, total inventory value, and how many products are at/below their reorder point.",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_low_stock_items",
+      description: "List products that are at or below their reorder point, with current quantity, reorder point, and which warehouse they're low in.",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "search_products",
+      description: "Search products by name or SKU. Returns price, cost, status, category, and stock quantity per warehouse for each match.",
+      parameters: {
+        type: "object",
+        properties: { query: { type: "string", description: "Product name or SKU (partial match)" } },
+        required: ["query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_sales_summary",
+      description: "Get total revenue, number of orders, and average order value from all sales orders (all-time).",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_top_products",
+      description: "Get the best-selling products ranked by total units sold across all sales orders.",
+      parameters: {
+        type: "object",
+        properties: { limit: { type: "number", description: "How many to return, default 5" } },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "search_customers",
+      description: "Search customers by name or email. Returns contact info, number of orders, and total amount spent.",
+      parameters: {
+        type: "object",
+        properties: { query: { type: "string", description: "Customer name or email (partial match)" } },
+        required: ["query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_pending_invoices",
+      description: "List invoices that are pending or overdue, with amount, due date, and customer name.",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_purchase_orders_status",
+      description: "Get counts and details of purchase orders by status (draft, pending, ordered, received), including which supplier and expected delivery date.",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_warehouses_overview",
+      description: "List all warehouses with their location and total units of stock currently held in each.",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+];
+
+const num = (d: unknown) => Number(d ?? 0);
+
+async function executeTool(name: string, args: any): Promise<unknown> {
+  switch (name) {
+    case "get_inventory_overview": {
+      const [productCount, inventory] = await Promise.all([
+        prisma.product.count(),
+        prisma.inventory.findMany({ include: { product: { select: { reorderPoint: true, price: true } } } }),
+      ]);
+      const totalUnits = inventory.reduce((sum, i) => sum + i.quantity, 0);
+      const totalValue = inventory.reduce((sum, i) => sum + i.quantity * num(i.product.price), 0);
+      const lowStockCount = inventory.filter((i) => i.quantity <= i.product.reorderPoint).length;
+      return { totalProducts: productCount, totalUnitsInStock: totalUnits, totalInventoryValue: Math.round(totalValue * 100) / 100, lowStockCount };
+    }
+    case "get_low_stock_items": {
+      const inventory = await prisma.inventory.findMany({
+        include: { product: { select: { name: true, sku: true, reorderPoint: true } }, warehouse: { select: { name: true } } },
+      });
+      return inventory
+        .filter((i) => i.quantity <= i.product.reorderPoint)
+        .map((i) => ({ product: i.product.name, sku: i.product.sku, warehouse: i.warehouse.name, quantity: i.quantity, reorderPoint: i.product.reorderPoint }));
+    }
+    case "search_products": {
+      const q = String(args?.query ?? "").trim();
+      const products = await prisma.product.findMany({
+        where: { OR: [{ name: { contains: q, mode: "insensitive" } }, { sku: { contains: q, mode: "insensitive" } }] },
+        include: { category: { select: { name: true } }, inventory: { include: { warehouse: { select: { name: true } } } } },
+        take: 10,
+      });
+      return products.map((p) => ({
+        name: p.name,
+        sku: p.sku,
+        price: num(p.price),
+        costPrice: num(p.costPrice),
+        status: p.status,
+        category: p.category?.name ?? null,
+        stockByWarehouse: p.inventory.map((i) => ({ warehouse: i.warehouse.name, quantity: i.quantity })),
+        totalStock: p.inventory.reduce((s, i) => s + i.quantity, 0),
+      }));
+    }
+    case "get_sales_summary": {
+      const orders = await prisma.salesOrder.findMany({ select: { total: true } });
+      const totalRevenue = orders.reduce((s, o) => s + num(o.total), 0);
+      return {
+        totalOrders: orders.length,
+        totalRevenue: Math.round(totalRevenue * 100) / 100,
+        averageOrderValue: orders.length ? Math.round((totalRevenue / orders.length) * 100) / 100 : 0,
+      };
+    }
+    case "get_top_products": {
+      const limit = Math.min(Math.max(Number(args?.limit) || 5, 1), 20);
+      const grouped = await prisma.salesOrderItem.groupBy({
+        by: ["productId"],
+        _sum: { quantity: true, total: true },
+        orderBy: { _sum: { quantity: "desc" } },
+        take: limit,
+      });
+      const products = await prisma.product.findMany({ where: { id: { in: grouped.map((g) => g.productId) } } });
+      return grouped.map((g) => {
+        const p = products.find((pr) => pr.id === g.productId);
+        return { product: p?.name ?? "Unknown", sku: p?.sku, unitsSold: g._sum.quantity ?? 0, revenue: Math.round(num(g._sum.total) * 100) / 100 };
+      });
+    }
+    case "search_customers": {
+      const q = String(args?.query ?? "").trim();
+      const customers = await prisma.customer.findMany({
+        where: { OR: [{ name: { contains: q, mode: "insensitive" } }, { email: { contains: q, mode: "insensitive" } }] },
+        include: { salesOrders: { select: { total: true } } },
+        take: 10,
+      });
+      return customers.map((c) => ({
+        name: c.name,
+        email: c.email,
+        phone: c.phone,
+        city: c.city,
+        orderCount: c.salesOrders.length,
+        totalSpent: Math.round(c.salesOrders.reduce((s, o) => s + num(o.total), 0) * 100) / 100,
+      }));
+    }
+    case "get_pending_invoices": {
+      const invoices = await prisma.invoice.findMany({
+        where: { status: { in: ["pending", "draft"] } },
+        include: { customer: { select: { name: true } } },
+        orderBy: { dueDate: "asc" },
+        take: 20,
+      });
+      const now = new Date();
+      return invoices.map((inv) => ({
+        invoiceNumber: inv.invoiceNumber,
+        customer: inv.customer.name,
+        total: num(inv.total),
+        dueDate: inv.dueDate.toISOString().slice(0, 10),
+        overdue: inv.dueDate < now,
+      }));
+    }
+    case "get_purchase_orders_status": {
+      const pos = await prisma.purchaseOrder.findMany({
+        include: { supplier: { select: { name: true } } },
+        orderBy: { createdAt: "desc" },
+        take: 20,
+      });
+      return pos.map((po) => ({
+        orderNumber: po.orderNumber,
+        supplier: po.supplier.name,
+        status: po.status,
+        total: num(po.total),
+        expectedDate: po.expectedDate ? po.expectedDate.toISOString().slice(0, 10) : null,
+      }));
+    }
+    case "get_warehouses_overview": {
+      const warehouses = await prisma.warehouse.findMany({ include: { inventory: { select: { quantity: true } } } });
+      return warehouses.map((w) => ({
+        name: w.name,
+        location: w.location,
+        isActive: w.isActive,
+        totalUnitsStocked: w.inventory.reduce((s, i) => s + i.quantity, 0),
+      }));
+    }
+    default:
+      return { error: `Unknown tool: ${name}` };
+  }
+}
+
+// Runs the tool-calling loop: ask the model, execute any tools it requests,
+// feed results back, repeat (bounded) until it gives a final text answer.
+async function chatWithTools(userMessages: { role: string; content: string }[], systemPrompt: string, maxTokens: number) {
+  const groqKey = process.env.GROQ_API_KEY;
+  if (!groqKey) {
+    return "AI assistant is not configured. Please set GROQ_API_KEY in your .env file. Get a free key at https://console.groq.com";
+  }
+
+  const messages: any[] = [{ role: "system", content: systemPrompt }, ...userMessages];
+
+  for (let round = 0; round < 4; round++) {
+    const response = await fetch(GROQ_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${groqKey}` },
+      body: JSON.stringify({
+        model: GROQ_MODEL,
+        messages,
+        tools: AI_TOOLS,
+        tool_choice: "auto",
+        max_tokens: maxTokens,
+        temperature: 0.4,
+      }),
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error("Groq API error:", errText);
+      throw new Error("AI service error");
+    }
+
+    const data = (await response.json()) as any;
+    const choice = data.choices?.[0]?.message;
+    if (!choice) return "";
+
+    if (!choice.tool_calls || choice.tool_calls.length === 0) {
+      return choice.content ?? "";
+    }
+
+    // Model wants data — run each requested tool against the real database.
+    messages.push(choice);
+    for (const call of choice.tool_calls) {
+      let args: any = {};
+      try { args = JSON.parse(call.function.arguments || "{}"); } catch { /* ignore malformed args */ }
+      const result = await executeTool(call.function.name, args);
+      messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
+    }
+  }
+
+  return "I looked into that but couldn't put together a complete answer — could you rephrase or ask about one thing at a time?";
 }
 
 function parseMessages(body: any): { role: string; content: string }[] | null {
@@ -165,7 +445,7 @@ router.post("/chat", requireAuth, async (req: AuthRequest, res: Response): Promi
       return;
     }
 
-    const content = await callGroq(messages.slice(-20), SYSTEM_PROMPT, 1024);
+    const content = await chatWithTools(messages.slice(-20), SYSTEM_PROMPT, 1024);
     res.json({ message: content, reply: content, role: "assistant" });
   } catch (err) {
     console.error("AI chat error:", err);
@@ -178,7 +458,7 @@ router.post("/chat", requireAuth, async (req: AuthRequest, res: Response): Promi
 // product-Q&A system prompt and kept short since it's unauthenticated and
 // has no per-user rate limiting yet - don't expand its capabilities without
 // adding real abuse protection (e.g. IP rate limiting) first.
-router.post("/public-chat", async (req: Request, res: Response): Promise<void> => {
+router.post("/public-chat", publicAiLimiter, async (req: Request, res: Response): Promise<void> => {
   try {
     const messages = parseMessages(req.body);
     if (!messages) {
@@ -193,7 +473,7 @@ router.post("/public-chat", async (req: Request, res: Response): Promise<void> =
       return;
     }
 
-    const content = await callGroq(lastMessages, PUBLIC_SYSTEM_PROMPT, 300);
+    const content = await callGroq(lastMessages, PUBLIC_SYSTEM_PROMPT, 450);
     res.json({ message: content, reply: content, role: "assistant" });
   } catch (err) {
     console.error("AI public chat error:", err);

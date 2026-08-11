@@ -4,6 +4,8 @@ import prisma from "../lib/prisma";
 import { signToken, requireAuth, AuthRequest } from "../middleware/auth";
 import { sendVerificationEmail, sendOtpEmail, sendPasswordResetEmail } from "../lib/email";
 import { generateOtp, generateToken, minutesFromNow } from "../lib/tokens";
+import { authLimiter } from "../middleware/rateLimit";
+import { validateBody, registerSchema, loginSchema, forgotPasswordSchema, resetPasswordSchema, verifyOtpSchema, resendOtpSchema } from "../lib/validation";
 
 const router = Router();
 
@@ -28,17 +30,9 @@ function publicUser(user: {
 }
 
 // POST /api/auth/register
-router.post("/register", async (req: Request, res: Response): Promise<void> => {
+router.post("/register", authLimiter, validateBody(registerSchema), async (req: Request, res: Response): Promise<void> => {
   try {
     const { name, email, password, role } = req.body;
-    if (!name || !email || !password) {
-      res.status(400).json({ error: "Name, email and password are required" });
-      return;
-    }
-    if (password.length < 6) {
-      res.status(400).json({ error: "Password must be at least 6 characters" });
-      return;
-    }
 
     const existing = await prisma.user.findUnique({ where: { email } });
     if (existing) {
@@ -91,13 +85,9 @@ router.post("/register", async (req: Request, res: Response): Promise<void> => {
 });
 
 // POST /api/auth/verify-otp
-router.post("/verify-otp", async (req: Request, res: Response): Promise<void> => {
+router.post("/verify-otp", authLimiter, validateBody(verifyOtpSchema), async (req: Request, res: Response): Promise<void> => {
   try {
     const { email, otp } = req.body;
-    if (!email || !otp) {
-      res.status(400).json({ error: "Email and code are required" });
-      return;
-    }
 
     const user = await prisma.user.findUnique({ where: { email } });
     if (!user) {
@@ -171,13 +161,9 @@ router.get("/verify-email", async (req: Request, res: Response): Promise<void> =
 });
 
 // POST /api/auth/resend-otp
-router.post("/resend-otp", async (req: Request, res: Response): Promise<void> => {
+router.post("/resend-otp", authLimiter, validateBody(resendOtpSchema), async (req: Request, res: Response): Promise<void> => {
   try {
     const { email } = req.body;
-    if (!email) {
-      res.status(400).json({ error: "Email is required" });
-      return;
-    }
 
     const user = await prisma.user.findUnique({ where: { email } });
     // Don't leak whether the account exists.
@@ -218,13 +204,9 @@ router.post("/resend-otp", async (req: Request, res: Response): Promise<void> =>
 });
 
 // POST /api/auth/login
-router.post("/login", async (req: Request, res: Response): Promise<void> => {
+router.post("/login", authLimiter, validateBody(loginSchema), async (req: Request, res: Response): Promise<void> => {
   try {
     const { email, password } = req.body;
-    if (!email || !password) {
-      res.status(400).json({ error: "Email and password are required" });
-      return;
-    }
 
     const user = await prisma.user.findUnique({ where: { email } });
     if (!user) {
@@ -256,13 +238,9 @@ router.post("/login", async (req: Request, res: Response): Promise<void> => {
 });
 
 // POST /api/auth/forgot-password
-router.post("/forgot-password", async (req: Request, res: Response): Promise<void> => {
+router.post("/forgot-password", authLimiter, validateBody(forgotPasswordSchema), async (req: Request, res: Response): Promise<void> => {
   try {
     const { email } = req.body;
-    if (!email) {
-      res.status(400).json({ error: "Email is required" });
-      return;
-    }
 
     const user = await prisma.user.findUnique({ where: { email } });
     // Always respond the same way to avoid leaking which emails are registered.
@@ -302,17 +280,9 @@ router.post("/forgot-password", async (req: Request, res: Response): Promise<voi
 });
 
 // POST /api/auth/reset-password
-router.post("/reset-password", async (req: Request, res: Response): Promise<void> => {
+router.post("/reset-password", authLimiter, validateBody(resetPasswordSchema), async (req: Request, res: Response): Promise<void> => {
   try {
     const { token, password } = req.body;
-    if (!token || !password) {
-      res.status(400).json({ error: "Token and new password are required" });
-      return;
-    }
-    if (password.length < 6) {
-      res.status(400).json({ error: "Password must be at least 6 characters" });
-      return;
-    }
 
     const user = await prisma.user.findUnique({ where: { resetToken: token } });
     if (!user || !user.resetTokenExpiresAt || user.resetTokenExpiresAt < new Date()) {

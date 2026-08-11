@@ -1,9 +1,19 @@
 import express from "express";
 import cors from "cors";
+import helmet from "helmet";
 import morgan from "morgan";
 import router from "./routes";
+import { generalLimiter } from "./middleware/rateLimit";
 
 const app = express();
+
+// Security headers (CSP kept report-only-ish/minimal since this API serves
+// JSON, not HTML — the main wins here are X-Content-Type-Options,
+// X-Frame-Options, and Strict-Transport-Security in production).
+app.use(helmet({
+  contentSecurityPolicy: false, // this is a JSON API, not a page-serving app; CSP is the frontend's job
+  crossOriginResourcePolicy: { policy: "cross-origin" },
+}));
 
 // Middleware
 // origin: "*" together with credentials: true is rejected by browsers (and
@@ -28,8 +38,10 @@ app.use(cors({
   credentials: true,
 }));
 app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
-app.use(express.json({ limit: "10mb" }));
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: true, limit: "2mb" }));
+app.set("trust proxy", 1); // needed for rate-limit / req.ip to work correctly behind a reverse proxy (Vercel, nginx, etc.)
+app.use("/api", generalLimiter);
 
 // Routes
 app.use("/api", router);

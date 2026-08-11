@@ -1,6 +1,6 @@
 import { Router, Response } from "express";
 import prisma from "../lib/prisma";
-import { requireAuth, AuthRequest } from "../middleware/auth";
+import { requireAuth, requireRole, AuthRequest } from "../middleware/auth";
 
 const router = Router();
 
@@ -203,7 +203,7 @@ router.patch("/:id", requireAuth, async (req: AuthRequest, res: Response): Promi
 });
 
 // DELETE /api/purchases/:id
-router.delete("/:id", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
+router.delete("/:id", requireAuth, requireRole("Purchasing Manager"), async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const id = parseInt(req.params.id);
     await prisma.$transaction([

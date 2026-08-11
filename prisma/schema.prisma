@@ -70,6 +70,8 @@ model Product {
   salesOrderItems       SalesOrderItem[]
   purchaseOrderItems    PurchaseOrderItem[]
 
+  @@index([status])
+  @@index([categoryId])
   @@map("products")
 }
 
@@ -99,6 +101,7 @@ model Inventory {
   warehouse Warehouse @relation(fields: [warehouseId], references: [id])
 
   @@unique([productId, warehouseId])
+  @@index([warehouseId])
   @@map("inventory")
 }
 
@@ -117,6 +120,9 @@ model InventoryTransaction {
   warehouse Warehouse @relation(fields: [warehouseId], references: [id])
   user      User?     @relation(fields: [performedBy], references: [id])
 
+  @@index([productId])
+  @@index([warehouseId])
+  @@index([createdAt])
   @@map("inventory_transactions")
 }
 
@@ -171,6 +177,9 @@ model SalesOrder {
   items    SalesOrderItem[]
   invoices Invoice[]
 
+  @@index([customerId])
+  @@index([status])
+  @@index([createdAt])
   @@map("sales_orders")
 }
 
@@ -187,6 +196,8 @@ model SalesOrderItem {
   order   SalesOrder @relation(fields: [orderId], references: [id])
   product Product    @relation(fields: [productId], references: [id])
 
+  @@index([orderId])
+  @@index([productId])
   @@map("sales_order_items")
 }
 
@@ -206,6 +217,10 @@ model PurchaseOrder {
   warehouse Warehouse?        @relation(fields: [warehouseId], references: [id])
   items     PurchaseOrderItem[]
 
+  @@index([supplierId])
+  @@index([warehouseId])
+  @@index([status])
+  @@index([createdAt])
   @@map("purchase_orders")
 }
 
@@ -221,6 +236,8 @@ model PurchaseOrderItem {
   order   PurchaseOrder @relation(fields: [orderId], references: [id])
   product Product       @relation(fields: [productId], references: [id])
 
+  @@index([orderId])
+  @@index([productId])
   @@map("purchase_order_items")
 }
 
@@ -242,6 +259,10 @@ model Invoice {
   customer    Customer    @relation(fields: [customerId], references: [id])
   salesOrder  SalesOrder? @relation(fields: [salesOrderId], references: [id])
 
+  @@index([customerId])
+  @@index([status])
+  @@index([dueDate])
+  @@index([salesOrderId])
   @@map("invoices")
 }
 
@@ -254,6 +275,8 @@ model Notification {
   data      Json?
   createdAt DateTime @default(now()) @map("created_at")
 
+  @@index([isRead])
+  @@index([createdAt])
   @@map("notifications")
 }
 
@@ -266,5 +289,6 @@ model AiConversation {
 
   user User @relation(fields: [userId], references: [id])
 
+  @@index([userId])
   @@map("ai_conversations")
 }

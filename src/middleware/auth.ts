@@ -79,3 +79,26 @@ export async function requireAuth(
   req.user = user;
   next();
 }
+
+/**
+ * RBAC gate — use *after* requireAuth. Administrator always passes,
+ * since it's the superset role; every other role must appear in the
+ * allowed list for this route. Previously `role` was stored and returned
+ * to the client but never actually checked anywhere, so every logged-in
+ * user — regardless of role — had identical access to every route. This
+ * is what actually enforces the permission model described at signup.
+ */
+export function requireRole(...allowed: string[]) {
+  return (req: AuthRequest, res: Response, next: NextFunction): void => {
+    const role = req.user?.role;
+    if (!role) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+    if (role === "Administrator" || allowed.includes(role)) {
+      next();
+      return;
+    }
+    res.status(403).json({ error: `This action requires one of these roles: ${allowed.join(", ")}` });
+  };
+}

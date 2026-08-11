@@ -1,6 +1,7 @@
 import { Router, Response } from "express";
 import prisma from "../lib/prisma";
-import { requireAuth, AuthRequest } from "../middleware/auth";
+import { requireAuth, requireRole, AuthRequest } from "../middleware/auth";
+import { getPagination, sendPaginated } from "../lib/pagination";
 
 const router = Router();
 
@@ -27,26 +28,34 @@ function formatProduct(p: any) {
 router.get("/", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { search, categoryId, status } = req.query as Record<string, string>;
+    const pagination = getPagination(req);
 
-    const products = await prisma.product.findMany({
-      where: {
-        ...(search && {
-          OR: [
-            { name: { contains: search, mode: "insensitive" } },
-            { sku: { contains: search, mode: "insensitive" } },
-          ],
-        }),
-        ...(categoryId && { categoryId: parseInt(categoryId) }),
-        ...(status && { status }),
-      },
-      include: {
-        category: { select: { name: true } },
-        inventory: { select: { quantity: true } },
-      },
-      orderBy: { createdAt: "asc" },
-    });
+    const where = {
+      ...(search && {
+        OR: [
+          { name: { contains: search, mode: "insensitive" as const } },
+          { sku: { contains: search, mode: "insensitive" as const } },
+        ],
+      }),
+      ...(categoryId && { categoryId: parseInt(categoryId) }),
+      ...(status && { status }),
+    };
 
-    res.json(products.map(formatProduct));
+    const [products, total] = await Promise.all([
+      prisma.product.findMany({
+        where,
+        include: {
+          category: { select: { name: true } },
+          inventory: { select: { quantity: true } },
+        },
+        orderBy: { createdAt: "asc" },
+        skip: pagination.skip,
+        take: pagination.take,
+      }),
+      prisma.product.count({ where }),
+    ]);
+
+    sendPaginated(res, products.map(formatProduct), total, pagination);
   } catch (err) {
     console.error("List products error:", err);
     res.status(500).json({ error: "Internal server error" });
@@ -161,7 +170,7 @@ router.patch("/:id", requireAuth, async (req: AuthRequest, res: Response): Promi
 });
 
 // DELETE /api/products/:id
-router.delete("/:id", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
+router.delete("/:id", requireAuth, requireRole("Inventory Manager"), async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const id = parseInt(req.params.id);
     await prisma.product.delete({ where: { id } });

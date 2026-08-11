@@ -1,8 +1,15 @@
 import { Router, Response } from "express";
+import { Prisma } from "@prisma/client";
 import prisma from "../lib/prisma";
-import { requireAuth, AuthRequest } from "../middleware/auth";
+import { requireAuth, requireRole, AuthRequest } from "../middleware/auth";
+import { getPagination, sendPaginated } from "../lib/pagination";
 
 const router = Router();
+
+// Real type for the transaction client instead of `any` — this is what
+// gives every tx.* call inside these two functions full type-checking and
+// autocomplete (and is what was silently defeating strict-mode checks below).
+type TxClient = Prisma.TransactionClient;
 
 class InsufficientStockError extends Error {
   constructor(productName: string) {
@@ -17,7 +24,7 @@ class InsufficientStockError extends Error {
 // Each individual deduction is recorded as its own InventoryTransaction so
 // that a later cancellation can reverse exactly what was taken from where.
 async function deductStockForOrder(
-  tx: any,
+  tx: TxClient,
   orderId: number,
   orderNumber: string,
   items: { productId: number; quantity: number }[],
@@ -70,7 +77,7 @@ async function deductStockForOrder(
 // order (looked up via the InventoryTransaction log), used when a completed
 // order is later cancelled.
 async function restockOrder(
-  tx: any,
+  tx: TxClient,
   orderId: number,
   orderNumber: string,
   performedBy: number | null | undefined
@@ -162,22 +169,30 @@ router.get("/summary/stats", requireAuth, async (_req: AuthRequest, res: Respons
 router.get("/", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { status, customerId } = req.query as Record<string, string>;
+    const pagination = getPagination(req);
 
-    const orders = await prisma.salesOrder.findMany({
-      where: {
-        ...(status && { status }),
-        ...(customerId && { customerId: parseInt(customerId) }),
-      },
-      include: {
-        customer: { select: { name: true } },
-        items: {
-          include: { product: { select: { name: true, sku: true } } },
+    const where = {
+      ...(status && { status }),
+      ...(customerId && { customerId: parseInt(customerId) }),
+    };
+
+    const [orders, total] = await Promise.all([
+      prisma.salesOrder.findMany({
+        where,
+        include: {
+          customer: { select: { name: true } },
+          items: {
+            include: { product: { select: { name: true, sku: true } } },
+          },
         },
-      },
-      orderBy: { createdAt: "desc" },
-    });
+        orderBy: { createdAt: "desc" },
+        skip: pagination.skip,
+        take: pagination.take,
+      }),
+      prisma.salesOrder.count({ where }),
+    ]);
 
-    res.json(orders.map(formatOrder));
+    sendPaginated(res, orders.map(formatOrder), total, pagination);
   } catch (err) {
     console.error("List sales orders error:", err);
     res.status(500).json({ error: "Internal server error" });
@@ -322,7 +337,7 @@ router.patch("/:id", requireAuth, async (req: AuthRequest, res: Response): Promi
 });
 
 // DELETE /api/sales/:id
-router.delete("/:id", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
+router.delete("/:id", requireAuth, requireRole("Sales Representative"), async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const id = parseInt(req.params.id);
     await prisma.$transaction([
