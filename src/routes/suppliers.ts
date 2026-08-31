@@ -1,6 +1,6 @@
 import { Router, Response } from "express";
 import prisma from "../lib/prisma";
-import { requireAuth, requireRole, AuthRequest } from "../middleware/auth";
+import { requireAuth, requireRole, verifyCsrf, AuthRequest } from "../middleware/auth";
 
 const router = Router();
 
@@ -8,16 +8,18 @@ const router = Router();
 router.get("/", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { search } = req.query as Record<string, string>;
+    const organizationId = req.user!.organizationId;
 
     const suppliers = await prisma.supplier.findMany({
-      where: search
-        ? {
-            OR: [
-              { name: { contains: search, mode: "insensitive" } },
-              { email: { contains: search, mode: "insensitive" } },
-            ],
-          }
-        : undefined,
+      where: {
+        organizationId,
+        ...(search && {
+          OR: [
+            { name: { contains: search, mode: "insensitive" as const } },
+            { email: { contains: search, mode: "insensitive" as const } },
+          ],
+        }),
+      },
       include: { _count: { select: { purchaseOrders: true } } },
       orderBy: { name: "asc" },
     });
@@ -36,7 +38,7 @@ router.get("/", requireAuth, async (req: AuthRequest, res: Response): Promise<vo
 });
 
 // POST /api/suppliers
-router.post("/", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
+router.post("/", requireAuth, verifyCsrf, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { name, email, phone, address, contactPerson, notes } = req.body;
     if (!name) {
@@ -44,12 +46,12 @@ router.post("/", requireAuth, async (req: AuthRequest, res: Response): Promise<v
       return;
     }
     const supplier = await prisma.supplier.create({
-      data: { name, email, phone, address, contactPerson, notes },
+      data: { organizationId: req.user!.organizationId, name, email, phone, address, contactPerson, notes },
     });
     res.status(201).json({ ...supplier, orderCount: 0, createdAt: supplier.createdAt.toISOString() });
   } catch (err: any) {
     if (err.code === "P2002") {
-      res.status(400).json({ error: "Email already exists" });
+      res.status(400).json({ error: "A supplier with this email already exists" });
       return;
     }
     console.error("Create supplier error:", err);
@@ -61,8 +63,8 @@ router.post("/", requireAuth, async (req: AuthRequest, res: Response): Promise<v
 router.get("/:id", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const id = parseInt(req.params.id);
-    const supplier = await prisma.supplier.findUnique({
-      where: { id },
+    const supplier = await prisma.supplier.findFirst({
+      where: { id, organizationId: req.user!.organizationId },
       include: { _count: { select: { purchaseOrders: true } } },
     });
     if (!supplier) {
@@ -77,10 +79,15 @@ router.get("/:id", requireAuth, async (req: AuthRequest, res: Response): Promise
 });
 
 // PATCH /api/suppliers/:id
-router.patch("/:id", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
+router.patch("/:id", requireAuth, verifyCsrf, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const id = parseInt(req.params.id);
     const { name, email, phone, address, contactPerson, notes } = req.body;
+    const owned = await prisma.supplier.findFirst({ where: { id, organizationId: req.user!.organizationId }, select: { id: true } });
+    if (!owned) {
+      res.status(404).json({ error: "Not found" });
+      return;
+    }
     const supplier = await prisma.supplier.update({
       where: { id },
       data: {
@@ -95,6 +102,10 @@ router.patch("/:id", requireAuth, async (req: AuthRequest, res: Response): Promi
     });
     res.json({ ...supplier, orderCount: supplier._count.purchaseOrders, createdAt: supplier.createdAt.toISOString() });
   } catch (err: any) {
+    if (err.code === "P2002") {
+      res.status(400).json({ error: "A supplier with this email already exists" });
+      return;
+    }
     if (err.code === "P2025") {
       res.status(404).json({ error: "Not found" });
       return;
@@ -105,10 +116,14 @@ router.patch("/:id", requireAuth, async (req: AuthRequest, res: Response): Promi
 });
 
 // DELETE /api/suppliers/:id
-router.delete("/:id", requireAuth, requireRole("Purchasing Manager"), async (req: AuthRequest, res: Response): Promise<void> => {
+router.delete("/:id", requireAuth, verifyCsrf, requireRole("Purchasing Manager"), async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const id = parseInt(req.params.id);
-    await prisma.supplier.delete({ where: { id } });
+    const result = await prisma.supplier.deleteMany({ where: { id, organizationId: req.user!.organizationId } });
+    if (result.count === 0) {
+      res.status(404).json({ error: "Not found" });
+      return;
+    }
     res.json({ message: "Deleted" });
   } catch (err: any) {
     if (err.code === "P2025") {

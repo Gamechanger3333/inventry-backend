@@ -1,8 +1,9 @@
 import { Router, Response } from "express";
 import { Prisma } from "@prisma/client";
 import prisma from "../lib/prisma";
-import { requireAuth, requireRole, AuthRequest } from "../middleware/auth";
+import { requireAuth, requireRole, verifyCsrf, AuthRequest } from "../middleware/auth";
 import { getPagination, sendPaginated } from "../lib/pagination";
+import { raiseLowStockAlerts } from "../lib/notify";
 
 const router = Router();
 
@@ -25,6 +26,7 @@ class InsufficientStockError extends Error {
 // that a later cancellation can reverse exactly what was taken from where.
 async function deductStockForOrder(
   tx: TxClient,
+  organizationId: number,
   orderId: number,
   orderNumber: string,
   items: { productId: number; quantity: number }[],
@@ -32,13 +34,13 @@ async function deductStockForOrder(
 ) {
   for (const item of items) {
     const inventoryRows = await tx.inventory.findMany({
-      where: { productId: item.productId, quantity: { gt: 0 } },
+      where: { organizationId, productId: item.productId, quantity: { gt: 0 } },
       orderBy: { warehouseId: "asc" },
     });
 
     const totalAvailable = inventoryRows.reduce((sum, row) => sum + row.quantity, 0);
     if (totalAvailable < item.quantity) {
-      const product = await tx.product.findUnique({ where: { id: item.productId } });
+      const product = await tx.product.findFirst({ where: { id: item.productId, organizationId } });
       throw new InsufficientStockError(product?.name ?? `product #${item.productId}`);
     }
 
@@ -48,7 +50,7 @@ async function deductStockForOrder(
       const take = Math.min(row.quantity, remaining);
 
       const decremented = await tx.inventory.updateMany({
-        where: { productId: row.productId, warehouseId: row.warehouseId, quantity: { gte: take } },
+        where: { organizationId, productId: row.productId, warehouseId: row.warehouseId, quantity: { gte: take } },
         data: { quantity: { decrement: take } },
       });
       if (decremented.count === 0) {
@@ -58,6 +60,7 @@ async function deductStockForOrder(
 
       await tx.inventoryTransaction.create({
         data: {
+          organizationId,
           productId: row.productId,
           warehouseId: row.warehouseId,
           type: "sale",
@@ -78,12 +81,13 @@ async function deductStockForOrder(
 // order is later cancelled.
 async function restockOrder(
   tx: TxClient,
+  organizationId: number,
   orderId: number,
   orderNumber: string,
   performedBy: number | null | undefined
 ) {
   const saleTxns = await tx.inventoryTransaction.findMany({
-    where: { type: "sale", notes: `orderId:${orderId}` },
+    where: { organizationId, type: "sale", notes: `orderId:${orderId}` },
   });
 
   for (const t of saleTxns) {
@@ -91,11 +95,12 @@ async function restockOrder(
     await tx.inventory.upsert({
       where: { productId_warehouseId: { productId: t.productId, warehouseId: t.warehouseId } },
       update: { quantity: { increment: restoreQty } },
-      create: { productId: t.productId, warehouseId: t.warehouseId, quantity: restoreQty },
+      create: { organizationId, productId: t.productId, warehouseId: t.warehouseId, quantity: restoreQty },
     });
 
     await tx.inventoryTransaction.create({
       data: {
+        organizationId,
         productId: t.productId,
         warehouseId: t.warehouseId,
         type: "sale_reversal",
@@ -139,13 +144,14 @@ function formatOrder(order: any) {
 }
 
 // GET /api/sales/summary/stats
-router.get("/summary/stats", requireAuth, async (_req: AuthRequest, res: Response): Promise<void> => {
+router.get("/summary/stats", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    const organizationId = req.user!.organizationId;
     const [total, pending, completed, cancelled] = await Promise.all([
-      prisma.salesOrder.aggregate({ _count: true, _sum: { total: true } }),
-      prisma.salesOrder.count({ where: { status: "pending" } }),
-      prisma.salesOrder.count({ where: { status: "completed" } }),
-      prisma.salesOrder.count({ where: { status: "cancelled" } }),
+      prisma.salesOrder.aggregate({ where: { organizationId }, _count: true, _sum: { total: true } }),
+      prisma.salesOrder.count({ where: { organizationId, status: "pending" } }),
+      prisma.salesOrder.count({ where: { organizationId, status: "completed" } }),
+      prisma.salesOrder.count({ where: { organizationId, status: "cancelled" } }),
     ]);
 
     const totalOrders = total._count;
@@ -172,6 +178,7 @@ router.get("/", requireAuth, async (req: AuthRequest, res: Response): Promise<vo
     const pagination = getPagination(req);
 
     const where = {
+      organizationId: req.user!.organizationId,
       ...(status && { status }),
       ...(customerId && { customerId: parseInt(customerId) }),
     };
@@ -200,11 +207,25 @@ router.get("/", requireAuth, async (req: AuthRequest, res: Response): Promise<vo
 });
 
 // POST /api/sales
-router.post("/", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
+router.post("/", requireAuth, verifyCsrf, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { customerId, items, discount, tax, notes } = req.body;
     if (!customerId || !items?.length) {
       res.status(400).json({ error: "Customer and items are required" });
+      return;
+    }
+
+    const organizationId = req.user!.organizationId;
+
+    const customer = await prisma.customer.findFirst({ where: { id: customerId, organizationId } });
+    if (!customer) {
+      res.status(400).json({ error: "Invalid customer" });
+      return;
+    }
+    const productIds = [...new Set(items.map((i: any) => i.productId))];
+    const ownedProductCount = await prisma.product.count({ where: { id: { in: productIds as number[] }, organizationId } });
+    if (ownedProductCount !== productIds.length) {
+      res.status(400).json({ error: "One or more items reference an invalid product" });
       return;
     }
 
@@ -218,6 +239,7 @@ router.post("/", requireAuth, async (req: AuthRequest, res: Response): Promise<v
 
     const order = await prisma.salesOrder.create({
       data: {
+        organizationId,
         orderNumber: genOrderNumber(),
         customerId,
         status: "pending",
@@ -253,8 +275,8 @@ router.post("/", requireAuth, async (req: AuthRequest, res: Response): Promise<v
 router.get("/:id", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const id = parseInt(req.params.id);
-    const order = await prisma.salesOrder.findUnique({
-      where: { id },
+    const order = await prisma.salesOrder.findFirst({
+      where: { id, organizationId: req.user!.organizationId },
       include: {
         customer: { select: { name: true } },
         items: { include: { product: { select: { name: true, sku: true } } } },
@@ -273,13 +295,14 @@ router.get("/:id", requireAuth, async (req: AuthRequest, res: Response): Promise
 });
 
 // PATCH /api/sales/:id
-router.patch("/:id", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
+router.patch("/:id", requireAuth, verifyCsrf, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const id = parseInt(req.params.id);
     const { status, notes } = req.body;
+    const organizationId = req.user!.organizationId;
 
-    const existing = await prisma.salesOrder.findUnique({
-      where: { id },
+    const existing = await prisma.salesOrder.findFirst({
+      where: { id, organizationId },
       include: { items: true },
     });
     if (!existing) {
@@ -295,6 +318,7 @@ router.patch("/:id", requireAuth, async (req: AuthRequest, res: Response): Promi
       if (willBeCompleted && !wasCompleted) {
         await deductStockForOrder(
           tx,
+          organizationId,
           existing.id,
           existing.orderNumber,
           existing.items.map((i) => ({ productId: i.productId, quantity: i.quantity })),
@@ -305,7 +329,7 @@ router.patch("/:id", requireAuth, async (req: AuthRequest, res: Response): Promi
       // Put stock back if a completed order is moved to any other status
       // (e.g. cancelled / refunded).
       if (wasCompleted && status !== undefined && !willBeCompleted) {
-        await restockOrder(tx, existing.id, existing.orderNumber, req.user?.id);
+        await restockOrder(tx, organizationId, existing.id, existing.orderNumber, req.user?.id);
       }
 
       return tx.salesOrder.update({
@@ -320,6 +344,23 @@ router.patch("/:id", requireAuth, async (req: AuthRequest, res: Response): Promi
         },
       });
     });
+
+    // Mirror the low-stock notification that /api/inventory/adjust creates,
+    // for the products this order just deducted stock from. Without this,
+    // completing a sale (the most common way stock actually drops below
+    // reorder point) never surfaced a "Low Stock Alert" - only a manual
+    // inventory adjustment did, even though both change the same numbers.
+    if (willBeCompleted && !wasCompleted) {
+      const productIds = [...new Set(existing.items.map((i) => i.productId))];
+      const rows = await prisma.inventory.findMany({
+        where: { organizationId, productId: { in: productIds } },
+        include: {
+          product: { select: { name: true, sku: true, reorderPoint: true } },
+          warehouse: { select: { name: true } },
+        },
+      });
+      await raiseLowStockAlerts(organizationId, rows);
+    }
 
     res.json(formatOrder(order));
   } catch (err: any) {
@@ -337,12 +378,26 @@ router.patch("/:id", requireAuth, async (req: AuthRequest, res: Response): Promi
 });
 
 // DELETE /api/sales/:id
-router.delete("/:id", requireAuth, requireRole("Sales Representative"), async (req: AuthRequest, res: Response): Promise<void> => {
+router.delete("/:id", requireAuth, verifyCsrf, requireRole("Sales Representative"), async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const id = parseInt(req.params.id);
+    const organizationId = req.user!.organizationId;
+
+    const existing = await prisma.salesOrder.findFirst({ where: { id, organizationId }, select: { id: true, status: true, orderNumber: true } });
+    if (!existing) {
+      res.status(404).json({ error: "Not found" });
+      return;
+    }
+    // Deleting a completed order without restocking would permanently
+    // "lose" the stock it deducted — force it through the cancel path first.
+    if (existing.status === "completed") {
+      res.status(400).json({ error: "Cancel this order (set status to cancelled) before deleting it, so its stock is restored first" });
+      return;
+    }
+
     await prisma.$transaction([
       prisma.salesOrderItem.deleteMany({ where: { orderId: id } }),
-      prisma.salesOrder.delete({ where: { id } }),
+      prisma.salesOrder.deleteMany({ where: { id, organizationId } }),
     ]);
     res.json({ message: "Deleted" });
   } catch (err: any) {

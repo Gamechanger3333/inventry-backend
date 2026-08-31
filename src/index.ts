@@ -1,6 +1,8 @@
 import "dotenv/config";
+import { createServer } from "http";
 import app from "./app";
 import prisma from "./lib/prisma";
+import { initRealtime } from "./lib/realtime";
 
 const port = Number(process.env.PORT) || 8080;
 
@@ -14,10 +16,17 @@ async function main() {
     process.exit(1);
   }
 
-  app.listen(port, () => {
+  // Socket.io needs the raw http.Server (not the Express app directly) so
+  // it can upgrade the same port to WebSocket connections for real-time
+  // low-stock notifications.
+  const server = createServer(app);
+  initRealtime(server);
+
+  server.listen(port, () => {
     console.log(`🚀 Nexus backend running on http://localhost:${port}`);
     console.log(`📡 API available at http://localhost:${port}/api`);
     console.log(`🔍 Health check: http://localhost:${port}/api/healthz`);
+    console.log(`🔌 Realtime (Socket.io) attached to the same port`);
   });
 
   // Graceful shutdown

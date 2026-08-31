@@ -1,5 +1,5 @@
 import { Router, Request, Response } from "express";
-import { requireAuth, AuthRequest } from "../middleware/auth";
+import { requireAuth, verifyCsrf, AuthRequest } from "../middleware/auth";
 import { publicAiLimiter } from "../middleware/rateLimit";
 import prisma from "../lib/prisma";
 
@@ -11,7 +11,7 @@ const GROQ_MODEL = "llama-3.3-70b-versatile";
 const LANGUAGE_INSTRUCTION = `Always reply in the same language and script the user just wrote in — including Roman Urdu/Hindi (Latin-script transliteration), Urdu/Hindi/Arabic script, Spanish, French, or any other language. Detect it from their latest message, don't ask which language to use, and don't switch languages mid-conversation unless the user does. Match their tone (casual vs formal) too.`;
 
 const SYSTEM_PROMPT = `You are an AI assistant for Nexus, an Inventory & Sales Management System.
-You have tools that query the real, live database — use them whenever a question depends on actual data (stock levels, sales figures, specific products/customers, invoices, purchase orders, warehouses). Never guess or make up numbers, names, or SKUs; call a tool to find out. If no tool covers what's being asked, say so honestly instead of inventing an answer.
+You have tools that query the real, live database — use them whenever a question depends on actual data (stock levels, sales figures, specific products/customers, invoices, purchase orders, warehouses). Every tool is automatically scoped to the current user's own company/organization, so you will only ever see and discuss that company's data. Never guess or make up numbers, names, or SKUs; call a tool to find out. If no tool covers what's being asked, say so honestly instead of inventing an answer.
 
 You help users with:
 - Understanding inventory levels, product stock, and reorder recommendations
@@ -27,9 +27,9 @@ Be concise, professional, and data-focused. Lead with the concrete numbers/names
 // Used on the public marketing site (landing page, login/signup, etc.)
 // where there is no logged-in user and therefore no business data to talk
 // about. Scoped to product/sales questions only.
-const PUBLIC_SYSTEM_PROMPT = `You are the pre-sales assistant on the Nexus marketing website. Nexus is an all-in-one inventory and sales management SaaS with: multi-warehouse inventory tracking with low-stock alerts, sales & purchase order management, customer/supplier CRM, invoicing, profit & loss and inventory reports, and role-based accounts.
+const PUBLIC_SYSTEM_PROMPT = `You are the pre-sales assistant on the Nexus marketing website. Nexus is an all-in-one inventory and sales management SaaS with: multi-warehouse inventory tracking with low-stock alerts, sales & purchase order management, customer/supplier CRM, invoicing, profit & loss and inventory reports, and role-based accounts for your whole team, each with their own company workspace.
 
-You help visitors understand what Nexus does, whether it fits their business, and how to get started (sign up is free, no credit card required; there's also a demo login: sarah@acmecorp.com / password123).
+You help visitors understand what Nexus does, whether it fits their business, and how to get started (sign up is free, no credit card required — creating an account sets up your own private company workspace; there's also a demo login: admin@nexus.com / password123).
 
 ${LANGUAGE_INSTRUCTION}
 
@@ -74,6 +74,12 @@ async function callGroq(messages: { role: string; content: string }[], systemPro
 // for a given question, we run the real Prisma query, feed the result
 // back to it, and it answers grounded in that live data. This is more
 // accurate than embedding-based retrieval for tabular business data.
+//
+// SECURITY NOTE: every executeTool query below is filtered by
+// organizationId. Previously none of them were — any authenticated
+// user could ask e.g. "search customers" and the assistant would
+// happily return every organization's customer data, not just their
+// own. That was the single most severe issue found in this codebase.
 // ─────────────────────────────────────────────────────────────────
 
 const AI_TOOLS = [
@@ -164,12 +170,12 @@ const AI_TOOLS = [
 
 const num = (d: unknown) => Number(d ?? 0);
 
-async function executeTool(name: string, args: any): Promise<unknown> {
+async function executeTool(name: string, args: any, organizationId: number): Promise<unknown> {
   switch (name) {
     case "get_inventory_overview": {
       const [productCount, inventory] = await Promise.all([
-        prisma.product.count(),
-        prisma.inventory.findMany({ include: { product: { select: { reorderPoint: true, price: true } } } }),
+        prisma.product.count({ where: { organizationId } }),
+        prisma.inventory.findMany({ where: { organizationId }, include: { product: { select: { reorderPoint: true, price: true } } } }),
       ]);
       const totalUnits = inventory.reduce((sum, i) => sum + i.quantity, 0);
       const totalValue = inventory.reduce((sum, i) => sum + i.quantity * num(i.product.price), 0);
@@ -178,6 +184,7 @@ async function executeTool(name: string, args: any): Promise<unknown> {
     }
     case "get_low_stock_items": {
       const inventory = await prisma.inventory.findMany({
+        where: { organizationId },
         include: { product: { select: { name: true, sku: true, reorderPoint: true } }, warehouse: { select: { name: true } } },
       });
       return inventory
@@ -187,7 +194,7 @@ async function executeTool(name: string, args: any): Promise<unknown> {
     case "search_products": {
       const q = String(args?.query ?? "").trim();
       const products = await prisma.product.findMany({
-        where: { OR: [{ name: { contains: q, mode: "insensitive" } }, { sku: { contains: q, mode: "insensitive" } }] },
+        where: { organizationId, OR: [{ name: { contains: q, mode: "insensitive" } }, { sku: { contains: q, mode: "insensitive" } }] },
         include: { category: { select: { name: true } }, inventory: { include: { warehouse: { select: { name: true } } } } },
         take: 10,
       });
@@ -203,7 +210,7 @@ async function executeTool(name: string, args: any): Promise<unknown> {
       }));
     }
     case "get_sales_summary": {
-      const orders = await prisma.salesOrder.findMany({ select: { total: true } });
+      const orders = await prisma.salesOrder.findMany({ where: { organizationId }, select: { total: true } });
       const totalRevenue = orders.reduce((s, o) => s + num(o.total), 0);
       return {
         totalOrders: orders.length,
@@ -213,13 +220,15 @@ async function executeTool(name: string, args: any): Promise<unknown> {
     }
     case "get_top_products": {
       const limit = Math.min(Math.max(Number(args?.limit) || 5, 1), 20);
+      const orgOrderIds = (await prisma.salesOrder.findMany({ where: { organizationId }, select: { id: true } })).map((o) => o.id);
       const grouped = await prisma.salesOrderItem.groupBy({
         by: ["productId"],
+        where: { orderId: { in: orgOrderIds } },
         _sum: { quantity: true, total: true },
         orderBy: { _sum: { quantity: "desc" } },
         take: limit,
       });
-      const products = await prisma.product.findMany({ where: { id: { in: grouped.map((g) => g.productId) } } });
+      const products = await prisma.product.findMany({ where: { id: { in: grouped.map((g) => g.productId) }, organizationId } });
       return grouped.map((g) => {
         const p = products.find((pr) => pr.id === g.productId);
         return { product: p?.name ?? "Unknown", sku: p?.sku, unitsSold: g._sum.quantity ?? 0, revenue: Math.round(num(g._sum.total) * 100) / 100 };
@@ -228,7 +237,7 @@ async function executeTool(name: string, args: any): Promise<unknown> {
     case "search_customers": {
       const q = String(args?.query ?? "").trim();
       const customers = await prisma.customer.findMany({
-        where: { OR: [{ name: { contains: q, mode: "insensitive" } }, { email: { contains: q, mode: "insensitive" } }] },
+        where: { organizationId, OR: [{ name: { contains: q, mode: "insensitive" } }, { email: { contains: q, mode: "insensitive" } }] },
         include: { salesOrders: { select: { total: true } } },
         take: 10,
       });
@@ -243,7 +252,7 @@ async function executeTool(name: string, args: any): Promise<unknown> {
     }
     case "get_pending_invoices": {
       const invoices = await prisma.invoice.findMany({
-        where: { status: { in: ["pending", "draft"] } },
+        where: { organizationId, status: { in: ["pending", "draft"] } },
         include: { customer: { select: { name: true } } },
         orderBy: { dueDate: "asc" },
         take: 20,
@@ -259,6 +268,7 @@ async function executeTool(name: string, args: any): Promise<unknown> {
     }
     case "get_purchase_orders_status": {
       const pos = await prisma.purchaseOrder.findMany({
+        where: { organizationId },
         include: { supplier: { select: { name: true } } },
         orderBy: { createdAt: "desc" },
         take: 20,
@@ -272,7 +282,7 @@ async function executeTool(name: string, args: any): Promise<unknown> {
       }));
     }
     case "get_warehouses_overview": {
-      const warehouses = await prisma.warehouse.findMany({ include: { inventory: { select: { quantity: true } } } });
+      const warehouses = await prisma.warehouse.findMany({ where: { organizationId }, include: { inventory: { select: { quantity: true } } } });
       return warehouses.map((w) => ({
         name: w.name,
         location: w.location,
@@ -287,7 +297,7 @@ async function executeTool(name: string, args: any): Promise<unknown> {
 
 // Runs the tool-calling loop: ask the model, execute any tools it requests,
 // feed results back, repeat (bounded) until it gives a final text answer.
-async function chatWithTools(userMessages: { role: string; content: string }[], systemPrompt: string, maxTokens: number) {
+async function chatWithTools(userMessages: { role: string; content: string }[], systemPrompt: string, maxTokens: number, organizationId: number) {
   const groqKey = process.env.GROQ_API_KEY;
   if (!groqKey) {
     return "AI assistant is not configured. Please set GROQ_API_KEY in your .env file. Get a free key at https://console.groq.com";
@@ -323,12 +333,13 @@ async function chatWithTools(userMessages: { role: string; content: string }[], 
       return choice.content ?? "";
     }
 
-    // Model wants data — run each requested tool against the real database.
+    // Model wants data — run each requested tool against the real database,
+    // scoped to the caller's own organization.
     messages.push(choice);
     for (const call of choice.tool_calls) {
       let args: any = {};
       try { args = JSON.parse(call.function.arguments || "{}"); } catch { /* ignore malformed args */ }
-      const result = await executeTool(call.function.name, args);
+      const result = await executeTool(call.function.name, args, organizationId);
       messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
     }
   }
@@ -345,13 +356,15 @@ function parseMessages(body: any): { role: string; content: string }[] | null {
 // GET /api/ai/insights
 // Computed from real data rather than static copy, so the numbers/names
 // always reflect what's actually in the database.
-router.get("/insights", requireAuth, async (_req: AuthRequest, res: Response): Promise<void> => {
+router.get("/insights", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    const organizationId = req.user!.organizationId;
     const insights: { id: number; type: string; title: string; priority: string; description: string }[] = [];
     let nextId = 1;
 
     // 1. Low stock items
     const inventory = await prisma.inventory.findMany({
+      where: { organizationId },
       include: { product: { select: { name: true, sku: true, reorderPoint: true } } },
     });
     const lowStock = inventory.filter((inv) => inv.quantity <= inv.product.reorderPoint);
@@ -375,14 +388,16 @@ router.get("/insights", requireAuth, async (_req: AuthRequest, res: Response): P
     }
 
     // 2. Top-selling product (by quantity across completed sales)
+    const orgOrderIds = (await prisma.salesOrder.findMany({ where: { organizationId }, select: { id: true } })).map((o) => o.id);
     const topLine = await prisma.salesOrderItem.groupBy({
       by: ["productId"],
+      where: { orderId: { in: orgOrderIds } },
       _sum: { quantity: true },
       orderBy: { _sum: { quantity: "desc" } },
       take: 1,
     });
     if (topLine.length > 0 && topLine[0]._sum.quantity) {
-      const product = await prisma.product.findUnique({ where: { id: topLine[0].productId } });
+      const product = await prisma.product.findFirst({ where: { id: topLine[0].productId, organizationId } });
       if (product) {
         insights.push({
           id: nextId++,
@@ -396,8 +411,8 @@ router.get("/insights", requireAuth, async (_req: AuthRequest, res: Response): P
 
     // 3. Pending / overdue invoices
     const [pendingCount, overdueCount] = await Promise.all([
-      prisma.invoice.count({ where: { status: "pending" } }),
-      prisma.invoice.count({ where: { status: "pending", dueDate: { lt: new Date() } } }),
+      prisma.invoice.count({ where: { organizationId, status: "pending" } }),
+      prisma.invoice.count({ where: { organizationId, status: "pending", dueDate: { lt: new Date() } } }),
     ]);
     if (overdueCount > 0) {
       insights.push({
@@ -418,7 +433,7 @@ router.get("/insights", requireAuth, async (_req: AuthRequest, res: Response): P
     }
 
     // 4. Pending purchase orders (procurement follow-up)
-    const pendingPOs = await prisma.purchaseOrder.count({ where: { status: { in: ["pending", "ordered"] } } });
+    const pendingPOs = await prisma.purchaseOrder.count({ where: { organizationId, status: { in: ["pending", "ordered"] } } });
     if (pendingPOs > 0) {
       insights.push({
         id: nextId++,
@@ -437,7 +452,7 @@ router.get("/insights", requireAuth, async (_req: AuthRequest, res: Response): P
 });
 
 // POST /api/ai/chat — authenticated, has full business-assistant framing
-router.post("/chat", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
+router.post("/chat", requireAuth, verifyCsrf, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const messages = parseMessages(req.body);
     if (!messages) {
@@ -445,7 +460,7 @@ router.post("/chat", requireAuth, async (req: AuthRequest, res: Response): Promi
       return;
     }
 
-    const content = await chatWithTools(messages.slice(-20), SYSTEM_PROMPT, 1024);
+    const content = await chatWithTools(messages.slice(-20), SYSTEM_PROMPT, 1024, req.user!.organizationId);
     res.json({ message: content, reply: content, role: "assistant" });
   } catch (err) {
     console.error("AI chat error:", err);

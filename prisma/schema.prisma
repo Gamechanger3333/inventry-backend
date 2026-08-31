@@ -10,15 +10,64 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+/// The tenant root. Every business-data row belongs to exactly one
+/// Organization; a User belongs to exactly one Organization. Signing up
+/// creates a new Organization (you become its Admin); teammates join via
+/// an invite created by an existing Admin of that same Organization.
+model Organization {
+  id        Int      @id @default(autoincrement())
+  name      String   @db.VarChar(255)
+  slug      String   @unique @db.VarChar(255)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  users                 User[]
+  categories            Category[]
+  products              Product[]
+  warehouses            Warehouse[]
+  inventory             Inventory[]
+  inventoryTransactions InventoryTransaction[]
+  customers             Customer[]
+  suppliers             Supplier[]
+  salesOrders           SalesOrder[]
+  purchaseOrders        PurchaseOrder[]
+  invoices              Invoice[]
+  notifications         Notification[]
+  invites               Invite[]
+
+  @@map("organizations")
+}
+
+/// A pending "join my company" link created by an Admin. Consumed once at
+/// registration time to attach the new user to the right Organization
+/// with the right role, instead of every signup silently creating (or
+/// worse, being able to guess its way into) another company's org.
+model Invite {
+  id             Int      @id @default(autoincrement())
+  organizationId Int      @map("organization_id")
+  email          String   @db.VarChar(255)
+  role           String   @db.VarChar(100)
+  token          String   @unique @db.VarChar(255)
+  expiresAt      DateTime @map("expires_at")
+  acceptedAt     DateTime? @map("accepted_at")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  @@index([organizationId])
+  @@map("invites")
+}
+
 model User {
-  id           Int      @id @default(autoincrement())
-  name         String   @db.VarChar(255)
-  email        String   @unique @db.VarChar(255)
-  passwordHash String   @map("password_hash")
-  role         String   @default("Sales Representative") @db.VarChar(100)
-  avatar       String?
-  createdAt    DateTime @default(now()) @map("created_at")
-  updatedAt    DateTime @updatedAt @map("updated_at")
+  id             Int      @id @default(autoincrement())
+  organizationId Int      @map("organization_id")
+  name           String   @db.VarChar(255)
+  email          String   @unique @db.VarChar(255)
+  passwordHash   String   @map("password_hash")
+  role           String   @default("Sales Representative") @db.VarChar(100)
+  avatar         String?
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
 
   // Email verification
   emailVerified         Boolean   @default(false) @map("email_verified")
@@ -31,95 +80,114 @@ model User {
   resetToken           String?   @unique @map("reset_token")
   resetTokenExpiresAt  DateTime? @map("reset_token_expires_at")
 
+  organization          Organization            @relation(fields: [organizationId], references: [id])
   inventoryTransactions InventoryTransaction[]
   aiConversations       AiConversation[]
 
+  @@index([organizationId])
   @@map("users")
 }
 
 model Category {
-  id          Int       @id @default(autoincrement())
-  name        String    @unique @db.VarChar(255)
-  description String?
-  color       String?   @db.VarChar(7)
-  createdAt   DateTime  @default(now()) @map("created_at")
-  updatedAt   DateTime  @updatedAt @map("updated_at")
+  id             Int       @id @default(autoincrement())
+  organizationId Int       @map("organization_id")
+  name           String    @db.VarChar(255)
+  description    String?
+  color          String?   @db.VarChar(7)
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
 
-  products Product[]
+  organization Organization @relation(fields: [organizationId], references: [id])
+  products     Product[]
 
+  @@unique([organizationId, name])
+  @@index([organizationId])
   @@map("categories")
 }
 
 model Product {
-  id           Int      @id @default(autoincrement())
-  name         String   @db.VarChar(255)
-  sku          String   @unique @db.VarChar(100)
-  description  String?
-  price        Decimal  @default(0) @db.Decimal(12, 2)
-  costPrice    Decimal  @default(0) @map("cost_price") @db.Decimal(12, 2)
-  status       String   @default("active") @db.VarChar(50)
-  categoryId   Int?     @map("category_id")
-  imageUrl     String?  @map("image_url")
-  reorderPoint Int      @default(10) @map("reorder_point")
-  createdAt    DateTime @default(now()) @map("created_at")
-  updatedAt    DateTime @updatedAt @map("updated_at")
+  id             Int      @id @default(autoincrement())
+  organizationId Int      @map("organization_id")
+  name           String   @db.VarChar(255)
+  sku            String   @db.VarChar(100)
+  description    String?
+  price          Decimal  @default(0) @db.Decimal(12, 2)
+  costPrice      Decimal  @default(0) @map("cost_price") @db.Decimal(12, 2)
+  status         String   @default("active") @db.VarChar(50)
+  categoryId     Int?     @map("category_id")
+  imageUrl       String?  @map("image_url")
+  reorderPoint   Int      @default(10) @map("reorder_point")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
 
+  organization          Organization           @relation(fields: [organizationId], references: [id])
   category              Category?              @relation(fields: [categoryId], references: [id])
   inventory             Inventory[]
   inventoryTransactions InventoryTransaction[]
   salesOrderItems       SalesOrderItem[]
   purchaseOrderItems    PurchaseOrderItem[]
 
+  @@unique([organizationId, sku])
+  @@index([organizationId])
   @@index([status])
   @@index([categoryId])
   @@map("products")
 }
 
 model Warehouse {
-  id        Int      @id @default(autoincrement())
-  name      String   @db.VarChar(255)
-  location  String?
-  isActive  Boolean  @default(true) @map("is_active")
-  createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
+  id             Int      @id @default(autoincrement())
+  organizationId Int      @map("organization_id")
+  name           String   @db.VarChar(255)
+  location       String?
+  isActive       Boolean  @default(true) @map("is_active")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
 
+  organization          Organization            @relation(fields: [organizationId], references: [id])
   inventory             Inventory[]
   inventoryTransactions InventoryTransaction[]
   purchaseOrders        PurchaseOrder[]
 
+  @@index([organizationId])
   @@map("warehouses")
 }
 
 model Inventory {
-  id          Int      @id @default(autoincrement())
-  productId   Int      @map("product_id")
-  warehouseId Int      @map("warehouse_id")
-  quantity    Int      @default(0)
-  updatedAt   DateTime @updatedAt @map("updated_at")
+  id             Int      @id @default(autoincrement())
+  organizationId Int      @map("organization_id")
+  productId      Int      @map("product_id")
+  warehouseId    Int      @map("warehouse_id")
+  quantity       Int      @default(0)
+  updatedAt      DateTime @updatedAt @map("updated_at")
 
-  product   Product   @relation(fields: [productId], references: [id])
-  warehouse Warehouse @relation(fields: [warehouseId], references: [id])
+  organization Organization @relation(fields: [organizationId], references: [id])
+  product      Product      @relation(fields: [productId], references: [id])
+  warehouse    Warehouse    @relation(fields: [warehouseId], references: [id])
 
   @@unique([productId, warehouseId])
+  @@index([organizationId])
   @@index([warehouseId])
   @@map("inventory")
 }
 
 model InventoryTransaction {
-  id          Int      @id @default(autoincrement())
-  productId   Int      @map("product_id")
-  warehouseId Int      @map("warehouse_id")
-  type        String   @db.VarChar(50)
-  quantity    Int
-  reason      String
-  notes       String?
-  performedBy Int?     @map("performed_by")
-  createdAt   DateTime @default(now()) @map("created_at")
+  id             Int      @id @default(autoincrement())
+  organizationId Int      @map("organization_id")
+  productId      Int      @map("product_id")
+  warehouseId    Int      @map("warehouse_id")
+  type           String   @db.VarChar(50)
+  quantity       Int
+  reason         String
+  notes          String?
+  performedBy    Int?     @map("performed_by")
+  createdAt      DateTime @default(now()) @map("created_at")
 
-  product   Product   @relation(fields: [productId], references: [id])
-  warehouse Warehouse @relation(fields: [warehouseId], references: [id])
-  user      User?     @relation(fields: [performedBy], references: [id])
+  organization Organization @relation(fields: [organizationId], references: [id])
+  product      Product      @relation(fields: [productId], references: [id])
+  warehouse    Warehouse    @relation(fields: [warehouseId], references: [id])
+  user         User?        @relation(fields: [performedBy], references: [id])
 
+  @@index([organizationId])
   @@index([productId])
   @@index([warehouseId])
   @@index([createdAt])
@@ -127,56 +195,68 @@ model InventoryTransaction {
 }
 
 model Customer {
-  id        Int      @id @default(autoincrement())
-  name      String   @db.VarChar(255)
-  email     String?  @unique @db.VarChar(255)
-  phone     String?  @db.VarChar(50)
-  address   String?
-  city      String?  @db.VarChar(100)
-  country   String?  @db.VarChar(100)
-  notes     String?
-  createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
+  id             Int      @id @default(autoincrement())
+  organizationId Int      @map("organization_id")
+  name           String   @db.VarChar(255)
+  email          String?  @db.VarChar(255)
+  phone          String?  @db.VarChar(50)
+  address        String?
+  city           String?  @db.VarChar(100)
+  country        String?  @db.VarChar(100)
+  notes          String?
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
 
-  salesOrders SalesOrder[]
-  invoices    Invoice[]
+  organization Organization @relation(fields: [organizationId], references: [id])
+  salesOrders  SalesOrder[]
+  invoices     Invoice[]
 
+  @@unique([organizationId, email])
+  @@index([organizationId])
   @@map("customers")
 }
 
 model Supplier {
-  id            Int      @id @default(autoincrement())
-  name          String   @db.VarChar(255)
-  email         String?  @unique @db.VarChar(255)
-  phone         String?  @db.VarChar(50)
-  address       String?
-  contactPerson String?  @map("contact_person") @db.VarChar(255)
-  notes         String?
-  createdAt     DateTime @default(now()) @map("created_at")
-  updatedAt     DateTime @updatedAt @map("updated_at")
+  id             Int      @id @default(autoincrement())
+  organizationId Int      @map("organization_id")
+  name           String   @db.VarChar(255)
+  email          String?  @db.VarChar(255)
+  phone          String?  @db.VarChar(50)
+  address        String?
+  contactPerson  String?  @map("contact_person") @db.VarChar(255)
+  notes          String?
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
 
+  organization   Organization    @relation(fields: [organizationId], references: [id])
   purchaseOrders PurchaseOrder[]
 
+  @@unique([organizationId, email])
+  @@index([organizationId])
   @@map("suppliers")
 }
 
 model SalesOrder {
-  id          Int      @id @default(autoincrement())
-  orderNumber String   @unique @map("order_number") @db.VarChar(50)
-  customerId  Int      @map("customer_id")
-  status      String   @default("pending") @db.VarChar(50)
-  subtotal    Decimal  @default(0) @db.Decimal(12, 2)
-  tax         Decimal  @default(0) @db.Decimal(12, 2)
-  discount    Decimal  @default(0) @db.Decimal(12, 2)
-  total       Decimal  @default(0) @db.Decimal(12, 2)
-  notes       String?
-  createdAt   DateTime @default(now()) @map("created_at")
-  updatedAt   DateTime @updatedAt @map("updated_at")
+  id             Int      @id @default(autoincrement())
+  organizationId Int      @map("organization_id")
+  orderNumber    String   @map("order_number") @db.VarChar(50)
+  customerId     Int      @map("customer_id")
+  status         String   @default("pending") @db.VarChar(50)
+  subtotal       Decimal  @default(0) @db.Decimal(12, 2)
+  tax            Decimal  @default(0) @db.Decimal(12, 2)
+  discount       Decimal  @default(0) @db.Decimal(12, 2)
+  total          Decimal  @default(0) @db.Decimal(12, 2)
+  notes          String?
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
 
-  customer Customer         @relation(fields: [customerId], references: [id])
-  items    SalesOrderItem[]
-  invoices Invoice[]
+  organization Organization     @relation(fields: [organizationId], references: [id])
+  customer     Customer         @relation(fields: [customerId], references: [id])
+  items        SalesOrderItem[]
+  invoices     Invoice[]
 
+  @@unique([organizationId, orderNumber])
+  @@index([organizationId])
   @@index([customerId])
   @@index([status])
   @@index([createdAt])
@@ -202,21 +282,25 @@ model SalesOrderItem {
 }
 
 model PurchaseOrder {
-  id           Int       @id @default(autoincrement())
-  orderNumber  String    @unique @map("order_number") @db.VarChar(50)
-  supplierId   Int       @map("supplier_id")
-  warehouseId  Int?      @map("warehouse_id")
-  status       String    @default("draft") @db.VarChar(50)
-  total        Decimal   @default(0) @db.Decimal(12, 2)
-  notes        String?
-  expectedDate DateTime? @map("expected_date")
-  createdAt    DateTime  @default(now()) @map("created_at")
-  updatedAt    DateTime  @updatedAt @map("updated_at")
+  id             Int       @id @default(autoincrement())
+  organizationId Int       @map("organization_id")
+  orderNumber    String    @map("order_number") @db.VarChar(50)
+  supplierId     Int       @map("supplier_id")
+  warehouseId    Int?      @map("warehouse_id")
+  status         String    @default("draft") @db.VarChar(50)
+  total          Decimal   @default(0) @db.Decimal(12, 2)
+  notes          String?
+  expectedDate   DateTime? @map("expected_date")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
 
-  supplier  Supplier          @relation(fields: [supplierId], references: [id])
-  warehouse Warehouse?        @relation(fields: [warehouseId], references: [id])
-  items     PurchaseOrderItem[]
+  organization Organization        @relation(fields: [organizationId], references: [id])
+  supplier     Supplier            @relation(fields: [supplierId], references: [id])
+  warehouse    Warehouse?          @relation(fields: [warehouseId], references: [id])
+  items        PurchaseOrderItem[]
 
+  @@unique([organizationId, orderNumber])
+  @@index([organizationId])
   @@index([supplierId])
   @@index([warehouseId])
   @@index([status])
@@ -242,23 +326,27 @@ model PurchaseOrderItem {
 }
 
 model Invoice {
-  id            Int       @id @default(autoincrement())
-  invoiceNumber String    @unique @map("invoice_number") @db.VarChar(50)
-  customerId    Int       @map("customer_id")
-  salesOrderId  Int?      @map("sales_order_id")
-  status        String    @default("draft") @db.VarChar(50)
-  subtotal      Decimal   @default(0) @db.Decimal(12, 2)
-  tax           Decimal   @default(0) @db.Decimal(12, 2)
-  total         Decimal   @default(0) @db.Decimal(12, 2)
-  dueDate       DateTime  @map("due_date")
-  paidAt        DateTime? @map("paid_at")
-  notes         String?
-  createdAt     DateTime  @default(now()) @map("created_at")
-  updatedAt     DateTime  @updatedAt @map("updated_at")
+  id             Int       @id @default(autoincrement())
+  organizationId Int       @map("organization_id")
+  invoiceNumber  String    @map("invoice_number") @db.VarChar(50)
+  customerId     Int       @map("customer_id")
+  salesOrderId   Int?      @map("sales_order_id")
+  status         String    @default("draft") @db.VarChar(50)
+  subtotal       Decimal   @default(0) @db.Decimal(12, 2)
+  tax            Decimal   @default(0) @db.Decimal(12, 2)
+  total          Decimal   @default(0) @db.Decimal(12, 2)
+  dueDate        DateTime  @map("due_date")
+  paidAt         DateTime? @map("paid_at")
+  notes          String?
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
 
-  customer    Customer    @relation(fields: [customerId], references: [id])
-  salesOrder  SalesOrder? @relation(fields: [salesOrderId], references: [id])
+  organization Organization @relation(fields: [organizationId], references: [id])
+  customer     Customer     @relation(fields: [customerId], references: [id])
+  salesOrder   SalesOrder?  @relation(fields: [salesOrderId], references: [id])
 
+  @@unique([organizationId, invoiceNumber])
+  @@index([organizationId])
   @@index([customerId])
   @@index([status])
   @@index([dueDate])
@@ -267,14 +355,18 @@ model Invoice {
 }
 
 model Notification {
-  id        Int      @id @default(autoincrement())
-  type      String   @db.VarChar(50)
-  title     String   @db.VarChar(255)
-  message   String
-  isRead    Boolean  @default(false) @map("is_read")
-  data      Json?
-  createdAt DateTime @default(now()) @map("created_at")
+  id             Int      @id @default(autoincrement())
+  organizationId Int      @map("organization_id")
+  type           String   @db.VarChar(50)
+  title          String   @db.VarChar(255)
+  message        String
+  isRead         Boolean  @default(false) @map("is_read")
+  data           Json?
+  createdAt      DateTime @default(now()) @map("created_at")
 
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  @@index([organizationId])
   @@index([isRead])
   @@index([createdAt])
   @@map("notifications")

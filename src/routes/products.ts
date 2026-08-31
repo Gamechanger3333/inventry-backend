@@ -1,6 +1,6 @@
 import { Router, Response } from "express";
 import prisma from "../lib/prisma";
-import { requireAuth, requireRole, AuthRequest } from "../middleware/auth";
+import { requireAuth, requireRole, verifyCsrf, AuthRequest } from "../middleware/auth";
 import { getPagination, sendPaginated } from "../lib/pagination";
 
 const router = Router();
@@ -31,6 +31,7 @@ router.get("/", requireAuth, async (req: AuthRequest, res: Response): Promise<vo
     const pagination = getPagination(req);
 
     const where = {
+      organizationId: req.user!.organizationId,
       ...(search && {
         OR: [
           { name: { contains: search, mode: "insensitive" as const } },
@@ -63,7 +64,7 @@ router.get("/", requireAuth, async (req: AuthRequest, res: Response): Promise<vo
 });
 
 // POST /api/products
-router.post("/", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
+router.post("/", requireAuth, verifyCsrf, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { name, sku, description, price, costPrice, status, categoryId, imageUrl, reorderPoint } = req.body;
     if (!name || !sku) {
@@ -71,8 +72,19 @@ router.post("/", requireAuth, async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
+    // A category picked from the dropdown must belong to this org too —
+    // otherwise a product could be filed under another company's category.
+    if (categoryId) {
+      const cat = await prisma.category.findFirst({ where: { id: categoryId, organizationId: req.user!.organizationId } });
+      if (!cat) {
+        res.status(400).json({ error: "Invalid category" });
+        return;
+      }
+    }
+
     const product = await prisma.product.create({
       data: {
+        organizationId: req.user!.organizationId,
         name,
         sku,
         description,
@@ -104,8 +116,8 @@ router.post("/", requireAuth, async (req: AuthRequest, res: Response): Promise<v
 router.get("/:id", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const id = parseInt(req.params.id);
-    const product = await prisma.product.findUnique({
-      where: { id },
+    const product = await prisma.product.findFirst({
+      where: { id, organizationId: req.user!.organizationId },
       include: {
         category: { select: { name: true } },
         inventory: {
@@ -134,10 +146,27 @@ router.get("/:id", requireAuth, async (req: AuthRequest, res: Response): Promise
 });
 
 // PATCH /api/products/:id
-router.patch("/:id", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
+router.patch("/:id", requireAuth, verifyCsrf, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const id = parseInt(req.params.id);
     const { name, sku, description, price, costPrice, status, categoryId, imageUrl, reorderPoint } = req.body;
+
+    const owned = await prisma.product.findFirst({
+      where: { id, organizationId: req.user!.organizationId },
+      select: { id: true },
+    });
+    if (!owned) {
+      res.status(404).json({ error: "Not found" });
+      return;
+    }
+
+    if (categoryId) {
+      const cat = await prisma.category.findFirst({ where: { id: categoryId, organizationId: req.user!.organizationId } });
+      if (!cat) {
+        res.status(400).json({ error: "Invalid category" });
+        return;
+      }
+    }
 
     const product = await prisma.product.update({
       where: { id },
@@ -160,6 +189,10 @@ router.patch("/:id", requireAuth, async (req: AuthRequest, res: Response): Promi
 
     res.json(formatProduct(product));
   } catch (err: any) {
+    if (err.code === "P2002") {
+      res.status(400).json({ error: "SKU already exists" });
+      return;
+    }
     if (err.code === "P2025") {
       res.status(404).json({ error: "Not found" });
       return;
@@ -170,10 +203,14 @@ router.patch("/:id", requireAuth, async (req: AuthRequest, res: Response): Promi
 });
 
 // DELETE /api/products/:id
-router.delete("/:id", requireAuth, requireRole("Inventory Manager"), async (req: AuthRequest, res: Response): Promise<void> => {
+router.delete("/:id", requireAuth, verifyCsrf, requireRole("Inventory Manager"), async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const id = parseInt(req.params.id);
-    await prisma.product.delete({ where: { id } });
+    const result = await prisma.product.deleteMany({ where: { id, organizationId: req.user!.organizationId } });
+    if (result.count === 0) {
+      res.status(404).json({ error: "Not found" });
+      return;
+    }
     res.json({ message: "Deleted" });
   } catch (err: any) {
     if (err.code === "P2025") {

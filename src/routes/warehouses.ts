@@ -1,13 +1,14 @@
 import { Router, Response } from "express";
 import prisma from "../lib/prisma";
-import { requireAuth, requireRole, AuthRequest } from "../middleware/auth";
+import { requireAuth, requireRole, verifyCsrf, AuthRequest } from "../middleware/auth";
 
 const router = Router();
 
 // GET /api/warehouses
-router.get("/", requireAuth, async (_req: AuthRequest, res: Response): Promise<void> => {
+router.get("/", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const warehouses = await prisma.warehouse.findMany({
+      where: { organizationId: req.user!.organizationId },
       orderBy: { name: "asc" },
     });
     res.json(warehouses.map((w) => ({ ...w, createdAt: w.createdAt.toISOString() })));
@@ -18,14 +19,14 @@ router.get("/", requireAuth, async (_req: AuthRequest, res: Response): Promise<v
 });
 
 // POST /api/warehouses
-router.post("/", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
+router.post("/", requireAuth, verifyCsrf, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { name, location } = req.body;
     if (!name) {
       res.status(400).json({ error: "Name is required" });
       return;
     }
-    const w = await prisma.warehouse.create({ data: { name, location } });
+    const w = await prisma.warehouse.create({ data: { name, location, organizationId: req.user!.organizationId } });
     res.status(201).json({ ...w, createdAt: w.createdAt.toISOString() });
   } catch (err) {
     console.error("Create warehouse error:", err);
@@ -37,7 +38,7 @@ router.post("/", requireAuth, async (req: AuthRequest, res: Response): Promise<v
 router.get("/:id", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const id = parseInt(req.params.id);
-    const w = await prisma.warehouse.findUnique({ where: { id } });
+    const w = await prisma.warehouse.findFirst({ where: { id, organizationId: req.user!.organizationId } });
     if (!w) {
       res.status(404).json({ error: "Not found" });
       return;
@@ -50,10 +51,15 @@ router.get("/:id", requireAuth, async (req: AuthRequest, res: Response): Promise
 });
 
 // PATCH /api/warehouses/:id
-router.patch("/:id", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
+router.patch("/:id", requireAuth, verifyCsrf, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const id = parseInt(req.params.id);
     const { name, location, isActive } = req.body;
+    const owned = await prisma.warehouse.findFirst({ where: { id, organizationId: req.user!.organizationId }, select: { id: true } });
+    if (!owned) {
+      res.status(404).json({ error: "Not found" });
+      return;
+    }
     const w = await prisma.warehouse.update({
       where: { id },
       data: {
@@ -74,10 +80,14 @@ router.patch("/:id", requireAuth, async (req: AuthRequest, res: Response): Promi
 });
 
 // DELETE /api/warehouses/:id
-router.delete("/:id", requireAuth, requireRole("Warehouse Manager"), async (req: AuthRequest, res: Response): Promise<void> => {
+router.delete("/:id", requireAuth, verifyCsrf, requireRole("Warehouse Manager"), async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const id = parseInt(req.params.id);
-    await prisma.warehouse.delete({ where: { id } });
+    const result = await prisma.warehouse.deleteMany({ where: { id, organizationId: req.user!.organizationId } });
+    if (result.count === 0) {
+      res.status(404).json({ error: "Not found" });
+      return;
+    }
     res.json({ message: "Deleted" });
   } catch (err: any) {
     if (err.code === "P2025") {

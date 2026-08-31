@@ -5,9 +5,11 @@ import { requireAuth, AuthRequest } from "../middleware/auth";
 const router = Router();
 
 // GET /api/reports/inventory
-router.get("/inventory", requireAuth, async (_req: AuthRequest, res: Response): Promise<void> => {
+router.get("/inventory", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    const organizationId = req.user!.organizationId;
     const products = await prisma.product.findMany({
+      where: { organizationId },
       include: {
         category: { select: { name: true } },
         inventory: { select: { quantity: true } },
@@ -29,6 +31,7 @@ router.get("/inventory", requireAuth, async (_req: AuthRequest, res: Response): 
 
     // By category
     const categories = await prisma.category.findMany({
+      where: { organizationId },
       include: {
         products: {
           include: { inventory: { select: { quantity: true } } },
@@ -67,12 +70,13 @@ router.get("/inventory", requireAuth, async (_req: AuthRequest, res: Response): 
 });
 
 // GET /api/reports/sales
-router.get("/sales", requireAuth, async (_req: AuthRequest, res: Response): Promise<void> => {
+router.get("/sales", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    const organizationId = req.user!.organizationId;
     const totals = await prisma.salesOrder.aggregate({
       _count: true,
       _sum: { total: true },
-      where: { status: "completed" },
+      where: { organizationId, status: "completed" },
     });
 
     const totalRevenue = Number(totals._sum.total ?? 0);
@@ -83,15 +87,15 @@ router.get("/sales", requireAuth, async (_req: AuthRequest, res: Response): Prom
       by: ["customerId"],
       _count: { id: true },
       _sum: { total: true },
-      where: { status: "completed" },
+      where: { organizationId, status: "completed" },
       orderBy: { _sum: { total: "desc" } },
       take: 10,
     });
 
     const topCustomers = await Promise.all(
       topCustomersRaw.map(async (row) => {
-        const customer = await prisma.customer.findUnique({
-          where: { id: row.customerId },
+        const customer = await prisma.customer.findFirst({
+          where: { id: row.customerId, organizationId },
           select: { name: true },
         });
         return {
@@ -114,7 +118,7 @@ router.get("/sales", requireAuth, async (_req: AuthRequest, res: Response): Prom
 
       const agg = await prisma.salesOrder.aggregate({
         _sum: { total: true },
-        where: { status: "completed", createdAt: { gte: start, lt: end } },
+        where: { organizationId, status: "completed", createdAt: { gte: start, lt: end } },
       });
 
       monthlyBreakdown.push({ label, value: Number(agg._sum.total ?? 0) });
@@ -134,8 +138,9 @@ router.get("/sales", requireAuth, async (_req: AuthRequest, res: Response): Prom
 });
 
 // GET /api/reports/profit-loss
-router.get("/profit-loss", requireAuth, async (_req: AuthRequest, res: Response): Promise<void> => {
+router.get("/profit-loss", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    const organizationId = req.user!.organizationId;
     const now = new Date();
     const monthlyData = [];
 
@@ -148,11 +153,11 @@ router.get("/profit-loss", requireAuth, async (_req: AuthRequest, res: Response)
       const [revAgg, items] = await Promise.all([
         prisma.salesOrder.aggregate({
           _sum: { total: true },
-          where: { status: "completed", createdAt: { gte: start, lt: end } },
+          where: { organizationId, status: "completed", createdAt: { gte: start, lt: end } },
         }),
         prisma.salesOrderItem.findMany({
           where: {
-            order: { status: "completed", createdAt: { gte: start, lt: end } },
+            order: { organizationId, status: "completed", createdAt: { gte: start, lt: end } },
           },
           include: { product: { select: { costPrice: true } } },
         }),

@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import morgan from "morgan";
+import cookieParser from "cookie-parser";
 import router from "./routes";
 import { generalLimiter } from "./middleware/rateLimit";
 
@@ -38,6 +39,7 @@ app.use(cors({
   credentials: true,
 }));
 app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
+app.use(cookieParser());
 app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true, limit: "2mb" }));
 app.set("trust proxy", 1); // needed for rate-limit / req.ip to work correctly behind a reverse proxy (Vercel, nginx, etc.)

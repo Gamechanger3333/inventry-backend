@@ -5,8 +5,9 @@ import { requireAuth, AuthRequest } from "../middleware/auth";
 const router = Router();
 
 // GET /api/dashboard/summary
-router.get("/summary", requireAuth, async (_req: AuthRequest, res: Response): Promise<void> => {
+router.get("/summary", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    const organizationId = req.user!.organizationId;
     const now = new Date();
     const thisMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
     const lastMonthStart = new Date(now.getFullYear(), now.getMonth() - 1, 1);
@@ -22,30 +23,32 @@ router.get("/summary", requireAuth, async (_req: AuthRequest, res: Response): Pr
       lastMonthOrders,
       pendingOrders,
     ] = await Promise.all([
-      prisma.product.count(),
-      prisma.customer.count(),
-      prisma.salesOrder.count(),
-      prisma.salesOrder.aggregate({ _sum: { total: true }, where: { status: "completed" } }),
+      prisma.product.count({ where: { organizationId } }),
+      prisma.customer.count({ where: { organizationId } }),
+      prisma.salesOrder.count({ where: { organizationId } }),
+      prisma.salesOrder.aggregate({ _sum: { total: true }, where: { organizationId, status: "completed" } }),
       prisma.salesOrder.aggregate({
         _sum: { total: true },
-        where: { status: "completed", createdAt: { gte: thisMonthStart } },
+        where: { organizationId, status: "completed", createdAt: { gte: thisMonthStart } },
       }),
       prisma.salesOrder.aggregate({
         _sum: { total: true },
         where: {
+          organizationId,
           status: "completed",
           createdAt: { gte: lastMonthStart, lt: thisMonthStart },
         },
       }),
-      prisma.salesOrder.count({ where: { createdAt: { gte: thisMonthStart } } }),
+      prisma.salesOrder.count({ where: { organizationId, createdAt: { gte: thisMonthStart } } }),
       prisma.salesOrder.count({
-        where: { createdAt: { gte: lastMonthStart, lt: thisMonthStart } },
+        where: { organizationId, createdAt: { gte: lastMonthStart, lt: thisMonthStart } },
       }),
-      prisma.salesOrder.count({ where: { status: "pending" } }),
+      prisma.salesOrder.count({ where: { organizationId, status: "pending" } }),
     ]);
 
     // Low stock count
     const inventory = await prisma.inventory.findMany({
+      where: { organizationId },
       include: { product: { select: { reorderPoint: true } } },
     });
     const lowStockCount = inventory.filter((inv) => inv.quantity <= inv.product.reorderPoint).length;
@@ -75,8 +78,9 @@ router.get("/summary", requireAuth, async (_req: AuthRequest, res: Response): Pr
 });
 
 // GET /api/dashboard/revenue-chart
-router.get("/revenue-chart", requireAuth, async (_req: AuthRequest, res: Response): Promise<void> => {
+router.get("/revenue-chart", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    const organizationId = req.user!.organizationId;
     const now = new Date();
     const months = [];
 
@@ -88,7 +92,7 @@ router.get("/revenue-chart", requireAuth, async (_req: AuthRequest, res: Respons
 
       const agg = await prisma.salesOrder.aggregate({
         _sum: { total: true },
-        where: { status: "completed", createdAt: { gte: start, lt: end } },
+        where: { organizationId, status: "completed", createdAt: { gte: start, lt: end } },
       });
 
       months.push({ label, value: Number(agg._sum.total ?? 0) });
@@ -102,10 +106,16 @@ router.get("/revenue-chart", requireAuth, async (_req: AuthRequest, res: Respons
 });
 
 // GET /api/dashboard/top-products
-router.get("/top-products", requireAuth, async (_req: AuthRequest, res: Response): Promise<void> => {
+router.get("/top-products", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    const organizationId = req.user!.organizationId;
+    // groupBy can't filter on a related order's organizationId directly,
+    // so first narrow to this org's own order-item ids.
+    const orgOrderIds = (await prisma.salesOrder.findMany({ where: { organizationId }, select: { id: true } })).map((o) => o.id);
+
     const topProducts = await prisma.salesOrderItem.groupBy({
       by: ["productId"],
+      where: { orderId: { in: orgOrderIds } },
       _sum: { total: true, quantity: true },
       orderBy: { _sum: { total: "desc" } },
       take: 10,
@@ -113,8 +123,8 @@ router.get("/top-products", requireAuth, async (_req: AuthRequest, res: Response
 
     const result = await Promise.all(
       topProducts.map(async (row) => {
-        const product = await prisma.product.findUnique({
-          where: { id: row.productId },
+        const product = await prisma.product.findFirst({
+          where: { id: row.productId, organizationId },
           include: { inventory: { select: { quantity: true } } },
         });
         const totalStock = product?.inventory.reduce((s, inv) => s + inv.quantity, 0) ?? 0;
@@ -138,15 +148,18 @@ router.get("/top-products", requireAuth, async (_req: AuthRequest, res: Response
 });
 
 // GET /api/dashboard/recent-activity
-router.get("/recent-activity", requireAuth, async (_req: AuthRequest, res: Response): Promise<void> => {
+router.get("/recent-activity", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    const organizationId = req.user!.organizationId;
     const [txns, orders] = await Promise.all([
       prisma.inventoryTransaction.findMany({
+        where: { organizationId },
         orderBy: { createdAt: "desc" },
         take: 10,
         select: { id: true, type: true, reason: true, createdAt: true },
       }),
       prisma.salesOrder.findMany({
+        where: { organizationId },
         orderBy: { createdAt: "desc" },
         take: 5,
         select: { id: true, orderNumber: true, status: true, total: true, createdAt: true },
@@ -178,9 +191,10 @@ router.get("/recent-activity", requireAuth, async (_req: AuthRequest, res: Respo
 });
 
 // GET /api/dashboard/low-stock
-router.get("/low-stock", requireAuth, async (_req: AuthRequest, res: Response): Promise<void> => {
+router.get("/low-stock", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const inventory = await prisma.inventory.findMany({
+      where: { organizationId: req.user!.organizationId },
       include: {
         product: { select: { name: true, sku: true, reorderPoint: true } },
         warehouse: { select: { name: true } },

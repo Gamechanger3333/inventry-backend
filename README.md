@@ -2,14 +2,24 @@
 
 Express.js + Prisma + PostgreSQL backend for the Nexus Inventory & Sales Management System.
 
+> **⚠️ Upgraded to true multi-tenant SaaS.** This version adds an `Organization` model that every
+> row now belongs to, switches auth from a `localStorage` JWT to an httpOnly cookie + CSRF token,
+> and adds Socket.io + email delivery for low-stock alerts. If you're upgrading an existing
+> database rather than starting fresh, **this is a breaking schema change** — see
+> [MIGRATION.md](./MIGRATION.md) before running anything below. If you're starting from a fresh
+> database, just follow Quick Start as normal; `npm run db:push` (or a fresh migration) will create
+> the new schema directly and `npm run db:seed` will create the demo Organization + Admin.
+
 ## Stack
 
 - **Runtime**: Node.js + TypeScript
 - **Framework**: Express.js v4
 - **ORM**: Prisma v5
 - **Database**: PostgreSQL
-- **Auth**: JWT (jsonwebtoken) + bcryptjs
-- **AI**: Groq API (optional)
+- **Auth**: JWT in an httpOnly cookie (jsonwebtoken) + bcryptjs + CSRF double-submit cookie
+- **Realtime**: Socket.io (org-scoped rooms, currently used for low-stock push notifications)
+- **Email**: Resend (verification, password reset, team invites, low-stock alerts)
+- **AI**: Groq API (optional) — every tool call is scoped to the caller's own organization
 
 ## Quick Start
 

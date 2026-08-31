@@ -1,6 +1,7 @@
 import { Router, Response } from "express";
 import prisma from "../lib/prisma";
-import { requireAuth, AuthRequest } from "../middleware/auth";
+import { requireAuth, verifyCsrf, AuthRequest } from "../middleware/auth";
+import { raiseLowStockAlerts } from "../lib/notify";
 
 const router = Router();
 
@@ -15,9 +16,11 @@ class InsufficientStockError extends Error {
 router.get("/", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { warehouseId, productId } = req.query as Record<string, string>;
+    const organizationId = req.user!.organizationId;
 
     const inventory = await prisma.inventory.findMany({
       where: {
+        organizationId,
         ...(warehouseId && { warehouseId: parseInt(warehouseId) }),
         ...(productId && { productId: parseInt(productId) }),
       },
@@ -48,11 +51,24 @@ router.get("/", requireAuth, async (req: AuthRequest, res: Response): Promise<vo
 });
 
 // POST /api/inventory/adjust
-router.post("/adjust", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
+router.post("/adjust", requireAuth, verifyCsrf, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { productId, warehouseId, quantity, reason } = req.body;
     if (!productId || !warehouseId || quantity === undefined || !reason) {
       res.status(400).json({ error: "productId, warehouseId, quantity and reason are required" });
+      return;
+    }
+
+    const organizationId = req.user!.organizationId;
+
+    // The product and warehouse must both belong to this org, or a user
+    // could adjust stock for another tenant's product by guessing its id.
+    const [product, warehouse] = await Promise.all([
+      prisma.product.findFirst({ where: { id: productId, organizationId } }),
+      prisma.warehouse.findFirst({ where: { id: warehouseId, organizationId } }),
+    ]);
+    if (!product || !warehouse) {
+      res.status(404).json({ error: "Product or warehouse not found" });
       return;
     }
 
@@ -70,7 +86,7 @@ router.post("/adjust", requireAuth, async (req: AuthRequest, res: Response): Pro
       const updated = await tx.inventory.upsert({
         where: { productId_warehouseId: { productId, warehouseId } },
         update: { quantity: newQty },
-        create: { productId, warehouseId, quantity: Math.max(0, quantity) },
+        create: { organizationId, productId, warehouseId, quantity: Math.max(0, quantity) },
         include: {
           product: { select: { name: true, sku: true, reorderPoint: true } },
           warehouse: { select: { name: true } },
@@ -79,6 +95,7 @@ router.post("/adjust", requireAuth, async (req: AuthRequest, res: Response): Pro
 
       await tx.inventoryTransaction.create({
         data: {
+          organizationId,
           productId,
           warehouseId,
           type: "adjustment",
@@ -91,17 +108,9 @@ router.post("/adjust", requireAuth, async (req: AuthRequest, res: Response): Pro
       return updated;
     });
 
-    // Auto-create low-stock notification
-    if (inv.quantity <= inv.product.reorderPoint) {
-      await prisma.notification.create({
-        data: {
-          type: "low_stock",
-          title: "Low Stock Alert",
-          message: `${inv.product.name} (${inv.product.sku}) is below reorder point in ${inv.warehouse.name}. Current: ${inv.quantity}, Reorder at: ${inv.product.reorderPoint}`,
-          data: { productId, warehouseId, quantity: inv.quantity },
-        },
-      });
-    }
+    await raiseLowStockAlerts(organizationId, [
+      { productId: inv.productId, warehouseId: inv.warehouseId, quantity: inv.quantity, product: inv.product, warehouse: inv.warehouse },
+    ]);
 
     res.json({
       id: inv.id,
@@ -121,7 +130,7 @@ router.post("/adjust", requireAuth, async (req: AuthRequest, res: Response): Pro
 });
 
 // POST /api/inventory/transfer
-router.post("/transfer", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
+router.post("/transfer", requireAuth, verifyCsrf, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { productId, fromWarehouseId, toWarehouseId, quantity, notes } = req.body;
     if (!productId || !fromWarehouseId || !toWarehouseId || !quantity) {
@@ -137,7 +146,19 @@ router.post("/transfer", requireAuth, async (req: AuthRequest, res: Response): P
       return;
     }
 
-    await prisma.$transaction(async (tx) => {
+    const organizationId = req.user!.organizationId;
+
+    const [product, fromWh, toWh] = await Promise.all([
+      prisma.product.findFirst({ where: { id: productId, organizationId } }),
+      prisma.warehouse.findFirst({ where: { id: fromWarehouseId, organizationId } }),
+      prisma.warehouse.findFirst({ where: { id: toWarehouseId, organizationId } }),
+    ]);
+    if (!product || !fromWh || !toWh) {
+      res.status(404).json({ error: "Product or warehouse not found" });
+      return;
+    }
+
+    const sourceAfter = await prisma.$transaction(async (tx) => {
       // Re-read the source row *inside* the transaction and guard the
       // decrement with a conditional update, so two concurrent transfers
       // can't both pass the "enough stock" check against the same stale
@@ -168,12 +189,13 @@ router.post("/transfer", requireAuth, async (req: AuthRequest, res: Response): P
       await tx.inventory.upsert({
         where: { productId_warehouseId: { productId, warehouseId: toWarehouseId } },
         update: { quantity: { increment: quantity } },
-        create: { productId, warehouseId: toWarehouseId, quantity },
+        create: { organizationId, productId, warehouseId: toWarehouseId, quantity },
       });
 
       // Transaction logs
       await tx.inventoryTransaction.create({
         data: {
+          organizationId,
           productId,
           warehouseId: fromWarehouseId,
           type: "transfer_out",
@@ -186,6 +208,7 @@ router.post("/transfer", requireAuth, async (req: AuthRequest, res: Response): P
 
       await tx.inventoryTransaction.create({
         data: {
+          organizationId,
           productId,
           warehouseId: toWarehouseId,
           type: "transfer_in",
@@ -195,7 +218,21 @@ router.post("/transfer", requireAuth, async (req: AuthRequest, res: Response): P
           performedBy: req.user?.id ?? null,
         },
       });
+
+      return fromInv.quantity - quantity;
     });
+
+    // The source warehouse may now be at/below reorder point even though
+    // nothing was "sold" - a transfer can trigger the same alert a sale can.
+    await raiseLowStockAlerts(organizationId, [
+      {
+        productId,
+        warehouseId: fromWarehouseId,
+        quantity: sourceAfter,
+        product: { name: product.name, sku: product.sku, reorderPoint: product.reorderPoint },
+        warehouse: { name: fromWh.name },
+      },
+    ]);
 
     res.json({ message: "Transfer completed successfully" });
   } catch (err) {
@@ -215,6 +252,7 @@ router.get("/transactions", requireAuth, async (req: AuthRequest, res: Response)
 
     const transactions = await prisma.inventoryTransaction.findMany({
       where: {
+        organizationId: req.user!.organizationId,
         ...(productId && { productId: parseInt(productId) }),
         ...(warehouseId && { warehouseId: parseInt(warehouseId) }),
       },

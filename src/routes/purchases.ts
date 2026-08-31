@@ -1,6 +1,6 @@
 import { Router, Response } from "express";
 import prisma from "../lib/prisma";
-import { requireAuth, requireRole, AuthRequest } from "../middleware/auth";
+import { requireAuth, requireRole, verifyCsrf, AuthRequest } from "../middleware/auth";
 
 const router = Router();
 
@@ -40,6 +40,7 @@ router.get("/", requireAuth, async (req: AuthRequest, res: Response): Promise<vo
 
     const orders = await prisma.purchaseOrder.findMany({
       where: {
+        organizationId: req.user!.organizationId,
         ...(status && { status }),
         ...(supplierId && { supplierId: parseInt(supplierId) }),
       },
@@ -59,7 +60,7 @@ router.get("/", requireAuth, async (req: AuthRequest, res: Response): Promise<vo
 });
 
 // POST /api/purchases
-router.post("/", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
+router.post("/", requireAuth, verifyCsrf, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { supplierId, warehouseId, items, notes, expectedDate } = req.body;
     if (!supplierId || !items?.length) {
@@ -67,10 +68,32 @@ router.post("/", requireAuth, async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
+    const organizationId = req.user!.organizationId;
+
+    const supplier = await prisma.supplier.findFirst({ where: { id: supplierId, organizationId } });
+    if (!supplier) {
+      res.status(400).json({ error: "Invalid supplier" });
+      return;
+    }
+    if (warehouseId) {
+      const wh = await prisma.warehouse.findFirst({ where: { id: warehouseId, organizationId } });
+      if (!wh) {
+        res.status(400).json({ error: "Invalid warehouse" });
+        return;
+      }
+    }
+    const productIds = [...new Set(items.map((i: any) => i.productId))];
+    const ownedProductCount = await prisma.product.count({ where: { id: { in: productIds as number[] }, organizationId } });
+    if (ownedProductCount !== productIds.length) {
+      res.status(400).json({ error: "One or more items reference an invalid product" });
+      return;
+    }
+
     const total = items.reduce((sum: number, item: any) => sum + item.quantity * item.unitCost, 0);
 
     const order = await prisma.purchaseOrder.create({
       data: {
+        organizationId,
         orderNumber: genOrderNumber(),
         supplierId,
         warehouseId: warehouseId || null,
@@ -105,8 +128,8 @@ router.post("/", requireAuth, async (req: AuthRequest, res: Response): Promise<v
 router.get("/:id", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const id = parseInt(req.params.id);
-    const order = await prisma.purchaseOrder.findUnique({
-      where: { id },
+    const order = await prisma.purchaseOrder.findFirst({
+      where: { id, organizationId: req.user!.organizationId },
       include: {
         supplier: { select: { name: true } },
         warehouse: { select: { name: true } },
@@ -126,12 +149,13 @@ router.get("/:id", requireAuth, async (req: AuthRequest, res: Response): Promise
 });
 
 // PATCH /api/purchases/:id — also handles receiving (status → received)
-router.patch("/:id", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
+router.patch("/:id", requireAuth, verifyCsrf, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const id = parseInt(req.params.id);
     const { status, notes, expectedDate } = req.body;
+    const organizationId = req.user!.organizationId;
 
-    const existing = await prisma.purchaseOrder.findUnique({ where: { id } });
+    const existing = await prisma.purchaseOrder.findFirst({ where: { id, organizationId } });
     if (!existing) {
       res.status(404).json({ error: "Not found" });
       return;
@@ -169,6 +193,7 @@ router.patch("/:id", requireAuth, async (req: AuthRequest, res: Response): Promi
             },
             update: { quantity: { increment: item.quantity } },
             create: {
+              organizationId,
               productId: item.productId,
               warehouseId: updated.warehouseId,
               quantity: item.quantity,
@@ -177,6 +202,7 @@ router.patch("/:id", requireAuth, async (req: AuthRequest, res: Response): Promi
 
           await tx.inventoryTransaction.create({
             data: {
+              organizationId,
               productId: item.productId,
               warehouseId: updated.warehouseId,
               type: "purchase_receipt",
@@ -203,12 +229,26 @@ router.patch("/:id", requireAuth, async (req: AuthRequest, res: Response): Promi
 });
 
 // DELETE /api/purchases/:id
-router.delete("/:id", requireAuth, requireRole("Purchasing Manager"), async (req: AuthRequest, res: Response): Promise<void> => {
+router.delete("/:id", requireAuth, verifyCsrf, requireRole("Purchasing Manager"), async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const id = parseInt(req.params.id);
+    const organizationId = req.user!.organizationId;
+
+    const existing = await prisma.purchaseOrder.findFirst({ where: { id, organizationId }, select: { id: true, status: true } });
+    if (!existing) {
+      res.status(404).json({ error: "Not found" });
+      return;
+    }
+    // Same reasoning as sales: deleting a received PO would silently drop
+    // the fact that stock was ever added for it.
+    if (existing.status === "received") {
+      res.status(400).json({ error: "A received purchase order cannot be deleted, as its stock has already been added to inventory" });
+      return;
+    }
+
     await prisma.$transaction([
       prisma.purchaseOrderItem.deleteMany({ where: { orderId: id } }),
-      prisma.purchaseOrder.delete({ where: { id } }),
+      prisma.purchaseOrder.deleteMany({ where: { id, organizationId } }),
     ]);
     res.json({ message: "Deleted" });
   } catch (err: any) {

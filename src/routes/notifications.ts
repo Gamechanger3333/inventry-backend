@@ -1,6 +1,6 @@
 import { Router, Response } from "express";
 import prisma from "../lib/prisma";
-import { requireAuth, AuthRequest } from "../middleware/auth";
+import { requireAuth, verifyCsrf, AuthRequest } from "../middleware/auth";
 
 const router = Router();
 
@@ -8,9 +8,10 @@ const router = Router();
 router.get("/", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { unread } = req.query as Record<string, string>;
+    const organizationId = req.user!.organizationId;
 
     const notifications = await prisma.notification.findMany({
-      where: unread === "true" ? { isRead: false } : undefined,
+      where: { organizationId, ...(unread === "true" && { isRead: false }) },
       orderBy: { createdAt: "desc" },
       take: 50,
     });
@@ -28,9 +29,15 @@ router.get("/", requireAuth, async (req: AuthRequest, res: Response): Promise<vo
 });
 
 // PATCH /api/notifications/:id/read
-router.patch("/:id/read", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
+router.patch("/:id/read", requireAuth, verifyCsrf, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const id = parseInt(req.params.id);
+    const organizationId = req.user!.organizationId;
+    const owned = await prisma.notification.findFirst({ where: { id, organizationId }, select: { id: true } });
+    if (!owned) {
+      res.status(404).json({ error: "Not found" });
+      return;
+    }
     const n = await prisma.notification.update({
       where: { id },
       data: { isRead: true },
@@ -47,9 +54,16 @@ router.patch("/:id/read", requireAuth, async (req: AuthRequest, res: Response): 
 });
 
 // POST /api/notifications/mark-all-read
-router.post("/mark-all-read", requireAuth, async (_req: AuthRequest, res: Response): Promise<void> => {
+router.post("/mark-all-read", requireAuth, verifyCsrf, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    await prisma.notification.updateMany({ data: { isRead: true } });
+    // PRE-EXISTING BUG FIXED HERE: this previously had no `where` clause at
+    // all, so any authenticated user marking "all read" silently marked
+    // *every organization's* notifications as read platform-wide. Now
+    // scoped to the caller's own organization.
+    await prisma.notification.updateMany({
+      where: { organizationId: req.user!.organizationId },
+      data: { isRead: true },
+    });
     res.json({ message: "All notifications marked as read" });
   } catch (err) {
     console.error("Mark all read error:", err);
@@ -58,10 +72,14 @@ router.post("/mark-all-read", requireAuth, async (_req: AuthRequest, res: Respon
 });
 
 // DELETE /api/notifications/:id
-router.delete("/:id", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
+router.delete("/:id", requireAuth, verifyCsrf, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const id = parseInt(req.params.id);
-    await prisma.notification.delete({ where: { id } });
+    const result = await prisma.notification.deleteMany({ where: { id, organizationId: req.user!.organizationId } });
+    if (result.count === 0) {
+      res.status(404).json({ error: "Not found" });
+      return;
+    }
     res.json({ message: "Deleted" });
   } catch (err: any) {
     if (err.code === "P2025") {

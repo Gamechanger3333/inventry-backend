@@ -1,6 +1,6 @@
 import { Router, Response } from "express";
 import prisma from "../lib/prisma";
-import { requireAuth, requireRole, AuthRequest } from "../middleware/auth";
+import { requireAuth, requireRole, verifyCsrf, AuthRequest } from "../middleware/auth";
 
 const router = Router();
 
@@ -33,6 +33,7 @@ router.get("/", requireAuth, async (req: AuthRequest, res: Response): Promise<vo
 
     const invoices = await prisma.invoice.findMany({
       where: {
+        organizationId: req.user!.organizationId,
         ...(status && { status }),
         ...(customerId && { customerId: parseInt(customerId) }),
       },
@@ -48,12 +49,27 @@ router.get("/", requireAuth, async (req: AuthRequest, res: Response): Promise<vo
 });
 
 // POST /api/invoices
-router.post("/", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
+router.post("/", requireAuth, verifyCsrf, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { customerId, salesOrderId, subtotal, tax, dueDate, notes } = req.body;
     if (!customerId || !dueDate) {
       res.status(400).json({ error: "Customer and dueDate are required" });
       return;
+    }
+
+    const organizationId = req.user!.organizationId;
+
+    const customer = await prisma.customer.findFirst({ where: { id: customerId, organizationId } });
+    if (!customer) {
+      res.status(400).json({ error: "Invalid customer" });
+      return;
+    }
+    if (salesOrderId) {
+      const so = await prisma.salesOrder.findFirst({ where: { id: salesOrderId, organizationId } });
+      if (!so) {
+        res.status(400).json({ error: "Invalid sales order" });
+        return;
+      }
     }
 
     const sub = subtotal || 0;
@@ -62,6 +78,7 @@ router.post("/", requireAuth, async (req: AuthRequest, res: Response): Promise<v
 
     const invoice = await prisma.invoice.create({
       data: {
+        organizationId,
         invoiceNumber: genInvoiceNumber(),
         customerId,
         salesOrderId: salesOrderId || null,
@@ -86,8 +103,8 @@ router.post("/", requireAuth, async (req: AuthRequest, res: Response): Promise<v
 router.get("/:id", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const id = parseInt(req.params.id);
-    const invoice = await prisma.invoice.findUnique({
-      where: { id },
+    const invoice = await prisma.invoice.findFirst({
+      where: { id, organizationId: req.user!.organizationId },
       include: { customer: { select: { name: true } } },
     });
     if (!invoice) {
@@ -102,10 +119,15 @@ router.get("/:id", requireAuth, async (req: AuthRequest, res: Response): Promise
 });
 
 // PATCH /api/invoices/:id
-router.patch("/:id", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
+router.patch("/:id", requireAuth, verifyCsrf, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const id = parseInt(req.params.id);
     const { status, notes, dueDate } = req.body;
+    const owned = await prisma.invoice.findFirst({ where: { id, organizationId: req.user!.organizationId }, select: { id: true } });
+    if (!owned) {
+      res.status(404).json({ error: "Not found" });
+      return;
+    }
 
     const invoice = await prisma.invoice.update({
       where: { id },
@@ -131,10 +153,14 @@ router.patch("/:id", requireAuth, async (req: AuthRequest, res: Response): Promi
 });
 
 // DELETE /api/invoices/:id
-router.delete("/:id", requireAuth, requireRole("Finance Manager"), async (req: AuthRequest, res: Response): Promise<void> => {
+router.delete("/:id", requireAuth, verifyCsrf, requireRole("Finance Manager"), async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const id = parseInt(req.params.id);
-    await prisma.invoice.delete({ where: { id } });
+    const result = await prisma.invoice.deleteMany({ where: { id, organizationId: req.user!.organizationId } });
+    if (result.count === 0) {
+      res.status(404).json({ error: "Not found" });
+      return;
+    }
     res.json({ message: "Deleted" });
   } catch (err: any) {
     if (err.code === "P2025") {

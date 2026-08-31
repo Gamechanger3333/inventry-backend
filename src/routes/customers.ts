@@ -1,6 +1,6 @@
 import { Router, Response } from "express";
 import prisma from "../lib/prisma";
-import { requireAuth, requireRole, AuthRequest } from "../middleware/auth";
+import { requireAuth, requireRole, verifyCsrf, AuthRequest } from "../middleware/auth";
 import { getPagination, sendPaginated } from "../lib/pagination";
 
 const router = Router();
@@ -10,15 +10,17 @@ router.get("/", requireAuth, async (req: AuthRequest, res: Response): Promise<vo
   try {
     const { search } = req.query as Record<string, string>;
     const pagination = getPagination(req);
+    const organizationId = req.user!.organizationId;
 
-    const where = search
-      ? {
-          OR: [
-            { name: { contains: search, mode: "insensitive" as const } },
-            { email: { contains: search, mode: "insensitive" as const } },
-          ],
-        }
-      : undefined;
+    const where = {
+      organizationId,
+      ...(search && {
+        OR: [
+          { name: { contains: search, mode: "insensitive" as const } },
+          { email: { contains: search, mode: "insensitive" as const } },
+        ],
+      }),
+    };
 
     const [customers, total] = await Promise.all([
       prisma.customer.findMany({
@@ -48,7 +50,7 @@ router.get("/", requireAuth, async (req: AuthRequest, res: Response): Promise<vo
 });
 
 // POST /api/customers
-router.post("/", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
+router.post("/", requireAuth, verifyCsrf, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { name, email, phone, address, city, country, notes } = req.body;
     if (!name) {
@@ -56,12 +58,12 @@ router.post("/", requireAuth, async (req: AuthRequest, res: Response): Promise<v
       return;
     }
     const customer = await prisma.customer.create({
-      data: { name, email, phone, address, city, country, notes },
+      data: { organizationId: req.user!.organizationId, name, email, phone, address, city, country, notes },
     });
     res.status(201).json({ ...customer, orderCount: 0, createdAt: customer.createdAt.toISOString() });
   } catch (err: any) {
     if (err.code === "P2002") {
-      res.status(400).json({ error: "Email already exists" });
+      res.status(400).json({ error: "A customer with this email already exists" });
       return;
     }
     console.error("Create customer error:", err);
@@ -73,8 +75,8 @@ router.post("/", requireAuth, async (req: AuthRequest, res: Response): Promise<v
 router.get("/:id", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const id = parseInt(req.params.id);
-    const customer = await prisma.customer.findUnique({
-      where: { id },
+    const customer = await prisma.customer.findFirst({
+      where: { id, organizationId: req.user!.organizationId },
       include: {
         _count: { select: { salesOrders: true } },
         salesOrders: {
@@ -105,10 +107,15 @@ router.get("/:id", requireAuth, async (req: AuthRequest, res: Response): Promise
 });
 
 // PATCH /api/customers/:id
-router.patch("/:id", requireAuth, async (req: AuthRequest, res: Response): Promise<void> => {
+router.patch("/:id", requireAuth, verifyCsrf, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const id = parseInt(req.params.id);
     const { name, email, phone, address, city, country, notes } = req.body;
+    const owned = await prisma.customer.findFirst({ where: { id, organizationId: req.user!.organizationId }, select: { id: true } });
+    if (!owned) {
+      res.status(404).json({ error: "Not found" });
+      return;
+    }
     const customer = await prisma.customer.update({
       where: { id },
       data: {
@@ -124,6 +131,10 @@ router.patch("/:id", requireAuth, async (req: AuthRequest, res: Response): Promi
     });
     res.json({ ...customer, orderCount: customer._count.salesOrders, createdAt: customer.createdAt.toISOString() });
   } catch (err: any) {
+    if (err.code === "P2002") {
+      res.status(400).json({ error: "A customer with this email already exists" });
+      return;
+    }
     if (err.code === "P2025") {
       res.status(404).json({ error: "Not found" });
       return;
@@ -134,10 +145,14 @@ router.patch("/:id", requireAuth, async (req: AuthRequest, res: Response): Promi
 });
 
 // DELETE /api/customers/:id
-router.delete("/:id", requireAuth, requireRole("Sales Representative", "Finance Manager"), async (req: AuthRequest, res: Response): Promise<void> => {
+router.delete("/:id", requireAuth, verifyCsrf, requireRole("Sales Representative", "Finance Manager"), async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const id = parseInt(req.params.id);
-    await prisma.customer.delete({ where: { id } });
+    const result = await prisma.customer.deleteMany({ where: { id, organizationId: req.user!.organizationId } });
+    if (result.count === 0) {
+      res.status(404).json({ error: "Not found" });
+      return;
+    }
     res.json({ message: "Deleted" });
   } catch (err: any) {
     if (err.code === "P2025") {

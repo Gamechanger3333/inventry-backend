@@ -1,16 +1,17 @@
 import { Router, Request, Response } from "express";
 import bcrypt from "bcryptjs";
 import prisma from "../lib/prisma";
-import { signToken, requireAuth, AuthRequest } from "../middleware/auth";
-import { sendVerificationEmail, sendOtpEmail, sendPasswordResetEmail } from "../lib/email";
-import { generateOtp, generateToken, minutesFromNow } from "../lib/tokens";
+import { signToken, requireAuth, requireRole, verifyCsrf, AuthRequest, AUTH_COOKIE, CSRF_COOKIE, authCookieOptions } from "../middleware/auth";
+import { sendVerificationEmail, sendOtpEmail, sendPasswordResetEmail, sendInviteEmail } from "../lib/email";
+import { generateOtp, generateToken, minutesFromNow, slugify } from "../lib/tokens";
 import { authLimiter } from "../middleware/rateLimit";
-import { validateBody, registerSchema, loginSchema, forgotPasswordSchema, resetPasswordSchema, verifyOtpSchema, resendOtpSchema } from "../lib/validation";
+import { validateBody, registerSchema, loginSchema, forgotPasswordSchema, resetPasswordSchema, verifyOtpSchema, resendOtpSchema, createInviteSchema } from "../lib/validation";
 
 const router = Router();
 
 function publicUser(user: {
   id: number;
+  organizationId: number;
   name: string;
   email: string;
   role: string;
@@ -20,6 +21,7 @@ function publicUser(user: {
 }) {
   return {
     id: user.id,
+    organizationId: user.organizationId,
     name: user.name,
     email: user.email,
     role: user.role,
@@ -29,15 +31,69 @@ function publicUser(user: {
   };
 }
 
+/**
+ * Establishes a session: signs the JWT into an httpOnly cookie and issues
+ * a fresh CSRF token into a second, JS-readable cookie. Called from every
+ * endpoint that used to just return `{ token }` in the response body.
+ */
+function startSession(res: Response, userId: number): void {
+  const token = signToken(userId);
+  res.cookie(AUTH_COOKIE, token, authCookieOptions());
+  const csrfToken = generateToken();
+  res.cookie(CSRF_COOKIE, csrfToken, { ...authCookieOptions(), httpOnly: false });
+}
+
+async function uniqueSlug(name: string): Promise<string> {
+  const base = slugify(name);
+  let candidate = base;
+  let n = 1;
+  // Small orgs, low collision odds - a short loop is fine, no need for a
+  // fancier scheme.
+  while (await prisma.organization.findUnique({ where: { slug: candidate } })) {
+    n += 1;
+    candidate = `${base}-${n}`;
+  }
+  return candidate;
+}
+
 // POST /api/auth/register
+// Either founds a new company (organizationName -> caller becomes that
+// org's Administrator) or joins an existing one via a valid, unexpired,
+// not-yet-used invite (inviteToken -> role comes from the invite, never
+// from the request body, so a joiner can't grant themselves Administrator).
 router.post("/register", authLimiter, validateBody(registerSchema), async (req: Request, res: Response): Promise<void> => {
   try {
-    const { name, email, password, role } = req.body;
+    const { name, email, password, organizationName, inviteToken } = req.body;
 
     const existing = await prisma.user.findUnique({ where: { email } });
     if (existing) {
       res.status(400).json({ error: "Email already registered" });
       return;
+    }
+
+    let organizationId: number;
+    let role: string;
+    let invite: { id: number } | null = null;
+
+    if (inviteToken) {
+      const found = await prisma.invite.findUnique({ where: { token: inviteToken } });
+      if (!found || found.acceptedAt || found.expiresAt < new Date()) {
+        res.status(400).json({ error: "This invite link is invalid or has expired" });
+        return;
+      }
+      if (found.email !== email) {
+        res.status(400).json({ error: "This invite was issued to a different email address" });
+        return;
+      }
+      organizationId = found.organizationId;
+      role = found.role;
+      invite = found;
+    } else {
+      const org = await prisma.organization.create({
+        data: { name: organizationName, slug: await uniqueSlug(organizationName) },
+      });
+      organizationId = org.id;
+      role = "Administrator";
     }
 
     const passwordHash = await bcrypt.hash(password, 10);
@@ -46,10 +102,11 @@ router.post("/register", authLimiter, validateBody(registerSchema), async (req: 
 
     const user = await prisma.user.create({
       data: {
+        organizationId,
         name,
         email,
         passwordHash,
-        role: role || "Sales Representative",
+        role,
         emailVerified: false,
         otpCode: otp,
         otpExpiresAt: minutesFromNow(15),
@@ -57,6 +114,10 @@ router.post("/register", authLimiter, validateBody(registerSchema), async (req: 
         verifyTokenExpiresAt: minutesFromNow(15),
       },
     });
+
+    if (invite) {
+      await prisma.invite.update({ where: { id: invite.id }, data: { acceptedAt: new Date() } });
+    }
 
     let emailSent = false;
     try {
@@ -80,6 +141,66 @@ router.post("/register", authLimiter, validateBody(registerSchema), async (req: 
     });
   } catch (err) {
     console.error("Register error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// POST /api/auth/invite — Administrator-only, invites a teammate into
+// *their own* organization (organizationId always comes from req.user,
+// never from the request body).
+router.post("/invite", requireAuth, verifyCsrf, requireRole("Administrator"), validateBody(createInviteSchema), async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { email, role } = req.body;
+
+    const existingUser = await prisma.user.findUnique({ where: { email } });
+    if (existingUser) {
+      res.status(400).json({ error: "A user with this email already exists" });
+      return;
+    }
+
+    const token = generateToken();
+    const invite = await prisma.invite.create({
+      data: {
+        organizationId: req.user!.organizationId,
+        email,
+        role,
+        token,
+        expiresAt: minutesFromNow(60 * 24 * 7), // 7 days
+      },
+    });
+
+    let emailSent = false;
+    try {
+      emailSent = await sendInviteEmail(email, req.user!.name, role, token);
+    } catch (emailErr) {
+      console.error("Failed to send invite email:", emailErr);
+    }
+
+    res.status(201).json({
+      message: emailSent ? "Invite sent." : "Invite created. No email provider is configured, so share this link directly.",
+      ...(process.env.NODE_ENV !== "production" && !emailSent ? { devInviteToken: invite.token } : {}),
+    });
+  } catch (err) {
+    console.error("Create invite error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// GET /api/auth/invite/:token — lets the signup page show which org/role
+// an invite is for before the user fills in the form.
+router.get("/invite/:token", async (req: Request, res: Response): Promise<void> => {
+  try {
+    const invite = await prisma.invite.findUnique({
+      where: { token: req.params.token },
+      include: { organization: { select: { name: true } } },
+    });
+    if (!invite || invite.acceptedAt || invite.expiresAt < new Date()) {
+      res.status(404).json({ error: "This invite link is invalid or has expired" });
+      return;
+    }
+    res.json({ email: invite.email, role: invite.role, organizationName: invite.organization.name });
+  } catch (err) {
+    console.error("Lookup invite error:", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -118,8 +239,8 @@ router.post("/verify-otp", authLimiter, validateBody(verifyOtpSchema), async (re
       },
     });
 
-    const token = signToken(updated.id);
-    res.json({ token, user: publicUser(updated) });
+    startSession(res, updated.id);
+    res.json({ user: publicUser(updated) });
   } catch (err) {
     console.error("Verify OTP error:", err);
     res.status(500).json({ error: "Internal server error" });
@@ -152,8 +273,8 @@ router.get("/verify-email", async (req: Request, res: Response): Promise<void> =
       },
     });
 
-    const authToken = signToken(updated.id);
-    res.json({ token: authToken, user: publicUser(updated) });
+    startSession(res, updated.id);
+    res.json({ user: publicUser(updated) });
   } catch (err) {
     console.error("Verify email error:", err);
     res.status(500).json({ error: "Internal server error" });
@@ -229,8 +350,8 @@ router.post("/login", authLimiter, validateBody(loginSchema), async (req: Reques
       return;
     }
 
-    const token = signToken(user.id);
-    res.json({ token, user: publicUser(user) });
+    startSession(res, user.id);
+    res.json({ user: publicUser(user) });
   } catch (err) {
     console.error("Login error:", err);
     res.status(500).json({ error: "Internal server error" });
@@ -307,13 +428,44 @@ router.post("/reset-password", authLimiter, validateBody(resetPasswordSchema), a
   }
 });
 
+// GET /api/auth/team — Administrator-only: everyone in the caller's own org.
+router.get("/team", requireAuth, requireRole("Administrator"), async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const [members, pendingInvites] = await Promise.all([
+      prisma.user.findMany({
+        where: { organizationId: req.user!.organizationId },
+        select: { id: true, name: true, email: true, role: true, avatar: true, emailVerified: true, createdAt: true },
+        orderBy: { createdAt: "asc" },
+      }),
+      prisma.invite.findMany({
+        where: { organizationId: req.user!.organizationId, acceptedAt: null, expiresAt: { gt: new Date() } },
+        select: { id: true, email: true, role: true, createdAt: true, expiresAt: true },
+        orderBy: { createdAt: "desc" },
+      }),
+    ]);
+    res.json({
+      members: members.map((m) => ({ ...m, createdAt: m.createdAt.toISOString() })),
+      pendingInvites: pendingInvites.map((i) => ({
+        ...i,
+        createdAt: i.createdAt.toISOString(),
+        expiresAt: i.expiresAt.toISOString(),
+      })),
+    });
+  } catch (err) {
+    console.error("List team error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 // GET /api/auth/me
 router.get("/me", requireAuth, (req: AuthRequest, res: Response): void => {
   res.json(publicUser(req.user!));
 });
 
 // POST /api/auth/logout
-router.post("/logout", (_req: Request, res: Response): void => {
+router.post("/logout", requireAuth, verifyCsrf, (_req: Request, res: Response): void => {
+  res.clearCookie(AUTH_COOKIE, { ...authCookieOptions(), maxAge: undefined });
+  res.clearCookie(CSRF_COOKIE, { ...authCookieOptions(), httpOnly: false, maxAge: undefined });
   res.json({ message: "Logged out" });
 });
 

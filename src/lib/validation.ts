@@ -21,11 +21,26 @@ const passwordSchema = z
   .regex(/[A-Za-z]/, "Password must contain at least one letter")
   .regex(/[0-9]/, "Password must contain at least one number");
 
-export const registerSchema = z.object({
-  name: z.string().trim().min(1, "Name is required").max(120),
+// Signing up either founds a brand-new company workspace (organizationName)
+// or joins an existing one via an Admin-issued invite (inviteToken) — never
+// both, and never neither, so a request can't silently create a stray org
+// nor silently self-assign into someone else's.
+export const registerSchema = z
+  .object({
+    name: z.string().trim().min(1, "Name is required").max(120),
+    email: z.string().trim().toLowerCase().email("Invalid email address"),
+    password: passwordSchema,
+    organizationName: z.string().trim().min(1).max(255).optional(),
+    inviteToken: z.string().trim().min(1).optional(),
+  })
+  .refine((data) => !!data.organizationName !== !!data.inviteToken, {
+    message: "Provide either organizationName (to create a new company) or inviteToken (to join one), not both",
+    path: ["organizationName"],
+  });
+
+export const createInviteSchema = z.object({
   email: z.string().trim().toLowerCase().email("Invalid email address"),
-  password: passwordSchema,
-  role: z.enum(ROLES).optional(),
+  role: z.enum(ROLES),
 });
 
 export const loginSchema = z.object({
