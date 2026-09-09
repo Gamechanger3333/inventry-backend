@@ -6,7 +6,7 @@ import prisma from "../lib/prisma";
 const router = Router();
 
 const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
-GROQ_MODEL = "openai/gpt-oss-120b";
+const GROQ_MODEL = "openai/gpt-oss-120b";
 
 const LANGUAGE_INSTRUCTION = `Always reply in the same language and script the user just wrote in — including Roman Urdu/Hindi (Latin-script transliteration), Urdu/Hindi/Arabic script, Spanish, French, or any other language. Detect it from their latest message, don't ask which language to use, and don't switch languages mid-conversation unless the user does. Match their tone (casual vs formal) too.`;
 
