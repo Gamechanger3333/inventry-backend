@@ -6,6 +6,7 @@ import { sendVerificationEmail, sendOtpEmail, sendPasswordResetEmail, sendInvite
 import { generateOtp, generateToken, minutesFromNow, slugify } from "../lib/tokens";
 import { authLimiter } from "../middleware/rateLimit";
 import { validateBody, registerSchema, loginSchema, forgotPasswordSchema, resetPasswordSchema, verifyOtpSchema, resendOtpSchema, createInviteSchema } from "../lib/validation";
+import { resetAndSeedDemoOrg } from "../lib/demoSeed";
 
 const router = Router();
 
@@ -354,6 +355,36 @@ router.post("/login", authLimiter, validateBody(loginSchema), async (req: Reques
     res.json({ user: publicUser(user) });
   } catch (err) {
     console.error("Login error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// POST /api/auth/demo-login
+// Public "try it now" shortcut — logs a visitor into a fixed, sandboxed
+// demo organization with realistic sample data, no signup/verification
+// needed. The demo org's data is wiped and reseeded fresh on every login
+// here (see lib/demoSeed.ts), so no two visitors' edits ever leak into
+// each other's session, and no real customer's data is ever touched
+// (this project is multi-tenant, so the reset is scoped to one org id).
+router.post("/demo-login", authLimiter, async (_req: Request, res: Response): Promise<void> => {
+  try {
+    const demoEmail = process.env.DEMO_USER_EMAIL;
+    if (!demoEmail) {
+      res.status(503).json({ error: "Demo account is not configured on this server." });
+      return;
+    }
+    const user = await prisma.user.findUnique({ where: { email: demoEmail } });
+    if (!user) {
+      res.status(503).json({ error: "Demo account is not set up yet. Run the seed script first." });
+      return;
+    }
+
+    await resetAndSeedDemoOrg(user.organizationId);
+
+    startSession(res, user.id);
+    res.json({ user: publicUser(user) });
+  } catch (err) {
+    console.error("Demo login error:", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
