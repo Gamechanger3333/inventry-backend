@@ -48,12 +48,17 @@ export function authCookieOptions() {
 }
 
 export function signToken(userId: number): string {
-  return jwt.sign({ userId }, JWT_SECRET, { expiresIn: "7d" });
+  return jwt.sign({ userId }, JWT_SECRET, { expiresIn: "7d", algorithm: "HS256" });
 }
 
 export function verifyToken(token: string): { userId: number } | null {
   try {
-    return jwt.verify(token, JWT_SECRET) as { userId: number };
+    // Explicitly pin the algorithm. Without this, jwt.verify accepts
+    // whatever algorithm the token header claims — including, for some
+    // library/config combinations, letting an attacker downgrade to a
+    // weaker or asymmetric-key-confused algorithm. Since we only ever
+    // sign with HS256, only ever accept HS256.
+    return jwt.verify(token, JWT_SECRET, { algorithms: ["HS256"] }) as { userId: number };
   } catch {
     return null;
   }
